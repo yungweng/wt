@@ -23,6 +23,19 @@ gh auth login
 cargo install --git https://github.com/yungweng/wt
 ```
 
+### Agent skill
+
+Install the companion `wt` skill globally for Claude Code and Codex:
+
+```sh
+npx --yes skills add yungweng/wt --skill wt --global \
+  --agent claude-code --agent codex --yes
+```
+
+The skill teaches agents to use `wt` for work tied to an existing GitHub issue
+and native Git for standalone worktrees. It never requires creating an issue
+just to create a worktree.
+
 ## Quick start
 
 Run the setup wizard in a GitHub repository:
