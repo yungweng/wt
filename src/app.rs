@@ -297,11 +297,11 @@ pub fn trust(yes: bool) -> Result<()> {
 }
 
 pub fn list(porcelain: bool, all: bool) -> Result<()> {
-    let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
-    let repository = repository(&repo_root)?;
     let mut records = Store::open()?.records()?;
     if !all {
-        records.retain(|record| record.repository == repository.slug);
+        let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
+        let repository = repository_slug(&repo_root)?;
+        records.retain(|record| record.repository.eq_ignore_ascii_case(&repository));
     }
     records.sort_by_key(|record| (record.repository.clone(), record.issue));
     if !porcelain && !records.is_empty() {
@@ -777,6 +777,34 @@ fn repository(repo_root: &Path) -> Result<Repository> {
     serde_json::from_slice(&output.stdout).context("parse repository details from gh")
 }
 
+fn repository_slug(repo_root: &Path) -> Result<String> {
+    let output = run(Command::new("git").current_dir(repo_root).args([
+        "config",
+        "--get",
+        "remote.origin.url",
+    ]))
+    .context("read origin remote")?;
+    github_slug(String::from_utf8(output.stdout)?.trim())
+}
+
+fn github_slug(remote: &str) -> Result<String> {
+    let path = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("git@github.com:"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .context("origin must point to a GitHub.com repository")?;
+    let path = path.trim_end_matches('/');
+    let slug = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(repository), None) = (parts.next(), parts.next(), parts.next()) else {
+        bail!("origin must contain a GitHub owner and repository");
+    };
+    if owner.is_empty() || repository.is_empty() {
+        bail!("origin must contain a GitHub owner and repository");
+    }
+    Ok(format!("{owner}/{repository}"))
+}
+
 fn issue(repo_root: &Path, number: u64, slug: &str) -> Result<Issue> {
     let output = run(Command::new("gh").current_dir(repo_root).args([
         "issue",
@@ -861,4 +889,26 @@ fn run(command: &mut Command) -> Result<Output> {
 
 fn path_str(path: &Path) -> Result<&str> {
     path.to_str().context("path is not valid UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::github_slug;
+
+    #[test]
+    fn parses_github_clone_urls() {
+        assert_eq!(
+            github_slug("https://github.com/acme/example.git").unwrap(),
+            "acme/example"
+        );
+        assert_eq!(
+            github_slug("git@github.com:acme/example.git").unwrap(),
+            "acme/example"
+        );
+        assert_eq!(
+            github_slug("ssh://git@github.com/acme/example.git").unwrap(),
+            "acme/example"
+        );
+        assert!(github_slug("https://example.com/acme/example.git").is_err());
+    }
 }

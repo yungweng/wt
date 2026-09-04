@@ -136,6 +136,7 @@ fn list_shows_and_remove_deletes_a_managed_worktree_but_keeps_its_branch() {
     let fixture = Fixture::new();
     assert_success(&fixture.wt(["add", "42"]));
     let path = fixture.worktrees.join("example/fix-42-handle-empty-input");
+    fixture.fail_gh_calls();
 
     let listed = fixture.wt(["list", "--porcelain"]);
     assert_success(&listed);
@@ -143,6 +144,7 @@ fn list_shows_and_remove_deletes_a_managed_worktree_but_keeps_its_branch() {
         String::from_utf8(listed.stdout).unwrap(),
         format!("42\tfix/42-handle-empty-input\t{}\n", path.display())
     );
+    write_fake_gh(&fixture.bin);
 
     let removed = fixture.wt(["remove", "42"]);
     assert_success(&removed);
@@ -154,6 +156,14 @@ fn list_shows_and_remove_deletes_a_managed_worktree_but_keeps_its_branch() {
         ),
         "fix/42-handle-empty-input"
     );
+}
+
+#[test]
+fn list_all_does_not_call_gh() {
+    let fixture = Fixture::new();
+    fixture.fail_gh_calls();
+
+    assert_success(&fixture.wt(["list", "--all", "--porcelain"]));
 }
 
 #[test]
@@ -473,7 +483,21 @@ impl Fixture {
         command(
             &repo,
             "git",
-            ["remote", "add", "origin", remote.to_str().unwrap()],
+            [
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                "https://github.com/acme/example.git",
+            ],
+        );
+        command(
+            &repo,
+            "git",
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/example.git",
+            ],
         );
         command(&repo, "git", ["push", "-u", "origin", "main"]);
         write_fake_gh(&bin);
@@ -504,6 +528,10 @@ impl Fixture {
         let path = self.repo.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    fn fail_gh_calls(&self) {
+        fs::write(self.bin.join("gh"), "#!/bin/sh\nexit 99\n").unwrap();
     }
 }
 
