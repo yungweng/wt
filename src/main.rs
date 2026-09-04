@@ -3,8 +3,7 @@ mod config;
 mod detection;
 mod environment;
 mod state;
-
-use std::io::IsTerminal;
+mod ui;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -18,6 +17,9 @@ use clap::{Args, Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Stream raw setup and teardown output
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -97,17 +99,15 @@ struct InitArgs {
 
 fn main() {
     if let Err(error) = run() {
-        if std::io::stderr().is_terminal() {
-            let _ = cliclack::log::error(format!("{error:#}"));
-        } else {
-            eprintln!("error: {error:#}");
-        }
+        eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
-    match Cli::parse().command {
+    ui::init();
+    let cli = Cli::parse();
+    match cli.command {
         Command::Init(args) => app::init(app::InitOptions {
             root: args.root,
             base: args.base,
@@ -124,12 +124,12 @@ fn run() -> Result<()> {
         Command::Add {
             reference,
             no_bootstrap,
-        } => app::add(&reference, no_bootstrap),
+        } => app::add(&reference, no_bootstrap, cli.verbose),
         Command::List { porcelain, all } => app::list(porcelain, all),
         Command::Remove {
             reference,
             force,
             skip_teardown,
-        } => app::remove(&reference, force, skip_teardown),
+        } => app::remove(&reference, force, skip_teardown, cli.verbose),
     }
 }

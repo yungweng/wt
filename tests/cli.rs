@@ -1,8 +1,11 @@
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    sync::mpsc,
+    time::Duration,
 };
 
 use tempfile::TempDir;
@@ -338,6 +341,156 @@ fn init_writes_config_and_trusted_bootstrap_runs_in_the_new_worktree() {
 }
 
 #[test]
+fn bootstrap_logs_preserve_stdout_stderr_order_and_keep_stdout_path_only() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt([
+        "init",
+        "--bootstrap",
+        "printf 'first\\n'; printf 'second\\n' >&2; printf 'third\\n'",
+        "--yes",
+    ]));
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    assert_eq!(
+        String::from_utf8_lossy(&added.stderr),
+        "first\nsecond\nthird\n"
+    );
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    assert!(path.join(".git").exists());
+}
+
+#[test]
+fn bootstrap_logs_are_visible_before_the_hook_exits() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt([
+        "init",
+        "--bootstrap",
+        "printf 'waiting\\n'; read answer; test \"$answer\" = continue",
+        "--yes",
+    ]));
+    let mut child = fixture
+        .wt_command(["add", "42"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(stderr).read_line(&mut line).unwrap();
+        sender.send(line).unwrap();
+    });
+    let line = receiver.recv_timeout(Duration::from_secs(3));
+    // Always release the hook, including when buffered output causes a timeout.
+    writeln!(child.stdin.take().unwrap(), "continue").unwrap();
+    assert_success(&child.wait_with_output().unwrap());
+    reader.join().unwrap();
+    assert_eq!(line.expect("bootstrap output was buffered"), "waiting\n");
+}
+
+#[test]
+fn bootstrap_does_not_block_an_unrelated_add() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt([
+        "init",
+        "--bootstrap",
+        "printf 'waiting\\n'; read answer",
+        "--yes",
+    ]));
+    let mut child = fixture
+        .wt_command(["add", "42"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    assert_eq!(line, "waiting\n");
+    std::thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        let fixture = &fixture;
+        scope.spawn(move || {
+            sender
+                .send(fixture.wt(["add", "41", "--no-bootstrap"]))
+                .unwrap()
+        });
+        let unrelated = receiver.recv_timeout(Duration::from_secs(3));
+        writeln!(child.stdin.take().unwrap(), "continue").unwrap();
+        assert_success(&child.wait_with_output().unwrap());
+        assert_success(&unrelated.expect("unrelated add waited for bootstrap"));
+    });
+}
+
+#[test]
+fn same_worktree_add_and_remove_wait_for_bootstrap() {
+    for args in [vec!["add", "42"], vec!["remove", "42", "--skip-teardown"]] {
+        let fixture = Fixture::new();
+        assert_success(&fixture.wt([
+            "init",
+            "--bootstrap",
+            "printf 'waiting\\n'; read answer",
+            "--yes",
+        ]));
+        let mut child = fixture
+            .wt_command(["add", "42"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        assert_eq!(line, "waiting\n");
+        let mut other = fixture
+            .wt_command(std::iter::empty::<&str>())
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let premature = other.try_wait().unwrap();
+        writeln!(child.stdin.take().unwrap(), "continue").unwrap();
+        assert_success(&child.wait_with_output().unwrap());
+        let output = other.wait_with_output().unwrap();
+        assert!(
+            premature.is_none(),
+            "same-worktree operation bypassed bootstrap lock"
+        );
+        assert_success(&output);
+    }
+}
+
+#[test]
+fn failed_bootstrap_streams_diagnostics_and_keeps_the_worktree() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt([
+        "init",
+        "--bootstrap",
+        "printf 'broken\\n' >&2; exit 7",
+        "--yes",
+    ]));
+    let failed = fixture.wt(["add", "42"]);
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("broken\n"));
+    assert!(stderr.contains("exit status: 7"));
+    assert!(stderr.contains("worktree kept at"));
+    assert!(failed.stdout.is_empty());
+    assert!(
+        fixture
+            .worktrees
+            .join("example/fix-42-handle-empty-input/.git")
+            .exists()
+    );
+}
+
+#[test]
 fn port_rewrites_do_not_cascade_between_adjacent_ports() {
     let fixture = Fixture::new();
     let (occupied, first) = adjacent_ports();
@@ -667,16 +820,20 @@ impl Fixture {
     }
 
     fn wt<const N: usize>(&self, args: [&str; N]) -> Output {
+        self.wt_command(args).output().unwrap()
+    }
+
+    fn wt_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Command {
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
-        Command::new(env!("CARGO_BIN_EXE_wt"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wt"));
+        command
             .args(args)
             .current_dir(&self.repo)
             .env("PATH", path)
             .env("WT_WORKTREE_ROOT", &self.worktrees)
             .env("WT_STATE_HOME", &self.state)
-            .env("XDG_CONFIG_HOME", &self.config)
-            .output()
-            .unwrap()
+            .env("XDG_CONFIG_HOME", &self.config);
+        command
     }
 
     fn write(&self, path: &str, contents: &str) {

@@ -101,6 +101,34 @@ If the branch already exists locally or on `origin`, `wt` checks it out.
 The default worktree root is `~/Developer/worktrees`. Change it with
 `wt init --root /absolute/path` or `WT_WORKTREE_ROOT`.
 
+## Progress and setup time
+
+`wt add` shows a compact repository header, completed steps, and a live elapsed
+timer for the current step. Routine bootstrap and teardown output stays hidden
+on a terminal; failures print the captured diagnostics. Use `--verbose` (`-v`)
+for live raw logs or commands that prompt for input. Redirected runs continue
+to stream logs to stderr, and stdout contains only the destination path.
+
+Set `NO_COLOR=1` to disable color. `TERM=dumb` also disables animation.
+A connected left rail and rotating indicator show progress; completed steps use
+diamonds. Labels and timings stay aligned. Setup and trust prompts share this layout.
+The status line uses no full-width padding, and the destination appears once.
+
+Bootstrap runs without holding the global state lock, so unrelated worktrees
+can be added while it runs. Adds and removals for the same worktree still wait
+for its bootstrap to finish.
+
+Bootstrap time includes the repository's configured setup command. A fresh
+frontend dependency installation can take much longer than Git checkout.
+To create the worktree without installing dependencies:
+
+```sh
+wt add 42 --no-bootstrap
+```
+
+Run the configured bootstrap command from that worktree when you need its
+build tools and dependencies. Skipping bootstrap does not make them ready.
+
 ## Safety and automation
 
 Without `--force`, `wt remove` refuses to delete a worktree with tracked

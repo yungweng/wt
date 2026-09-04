@@ -1,8 +1,9 @@
 use std::{
     fs,
-    io::IsTerminal,
+    io::{self, IsTerminal, Seek},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,7 @@ use crate::{
     detection::{self, EnvTemplate, Report},
     environment,
     state::{Record, Store},
+    ui::{self, progress, style},
 };
 
 #[derive(Deserialize)]
@@ -58,25 +60,33 @@ enum AddTarget {
     Branch(String),
 }
 
-pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
+pub fn add(reference: &str, no_bootstrap: bool, verbose: bool) -> Result<()> {
+    let started = Instant::now();
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let slug = repository_slug(&repo_root)?;
     let target = add_target(reference, &slug)?;
     let store = Store::open()?;
-    let _lock = store.lock()?;
+    let target_key = match &target {
+        AddTarget::Issue(number) => number.to_string(),
+        AddTarget::Branch(branch) => branch.clone(),
+    };
+    // Always take the worktree lock before the shared port/state lock.
+    let _worktree_lock = store.lock_worktree(&slug, &target_key)?;
+    let lock = store.lock()?;
     if let Some(record) = find_record(&store, &slug, &target)? {
         if record.path.exists() {
             println!("{}", record.path.display());
             return Ok(());
         }
     }
+    ui::heading(slug.rsplit('/').next().unwrap_or(&slug), &target_key);
     offer_setup(&repo_root)?;
     let plan = target_plan(&repo_root, &slug, target)?;
     let config = Config::load(&repo_root)?;
     let base = base_branch(&repo_root, &config, plan.issue)?;
     let config_hash = config.command_fingerprint()?;
     ensure_trusted_commands(&store, &slug, &config, config_hash.as_deref(), no_bootstrap)?;
-    progress("Creating worktree", "Worktree ready", || {
+    progress("Creating worktree", "Worktree created", || {
         install_worktree(
             &store,
             &config,
@@ -87,10 +97,10 @@ pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
             config_hash,
         )
     })?;
-    run_bootstrap(&config, &plan, no_bootstrap)?;
-    if std::io::stderr().is_terminal() {
-        cliclack::log::success(format!("Ready at {}", plan.path.display()))?;
-    }
+    // Ports and the record are saved. Other worktrees can now finish setup.
+    drop(lock);
+    run_bootstrap(&config, &plan, no_bootstrap, verbose)?;
+    ui::ready(started, no_bootstrap && config.bootstrap.is_some());
     println!("{}", plan.path.display());
     Ok(())
 }
@@ -214,13 +224,10 @@ fn prepare_record(
     })
 }
 
-fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool) -> Result<()> {
+fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool, verbose: bool) -> Result<()> {
     if !skipped {
         if let Some(command) = &config.bootstrap {
-            progress("Running bootstrap", "Bootstrap complete", || {
-                run_hook("bootstrap", command, &plan.path)
-            })
-            .with_context(|| {
+            run_hook("bootstrap", command, &plan.path, verbose).with_context(|| {
                 format!("bootstrap failed; worktree kept at {}", plan.path.display())
             })?;
         }
@@ -385,10 +392,11 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn remove(reference: &str, force: bool, skip_teardown: bool) -> Result<()> {
+pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let repository = repository_slug(&repo_root)?;
     let store = Store::open()?;
+    let _worktree_lock = store.lock_worktree(&repository, reference)?;
     let _lock = store.lock()?;
     let record = match reference.parse::<u64>() {
         Ok(issue) => store.find_issue(&repository, issue)?,
@@ -399,14 +407,14 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool) -> Result<()> {
         ensure_safe_to_remove(&record)?;
     }
     if !skip_teardown {
-        run_recorded_teardown(&store, &record)?;
+        run_recorded_teardown(&store, &record, verbose)?;
     }
     progress("Removing worktree", "Worktree removed", || {
         remove_recorded_worktree(&repo_root, &record, force)
     })?;
     store.delete(&record)?;
     if std::io::stderr().is_terminal() {
-        cliclack::log::success(format!("Kept branch {}", record.branch))?;
+        eprintln!("{} Kept branch {}", style("◇", 32), record.branch);
     }
     Ok(())
 }
@@ -711,28 +719,49 @@ fn ensure_trusted_commands(
     store.trust(repository, hash)
 }
 
-fn run_hook(name: &str, command: &str, directory: &Path) -> Result<()> {
-    let output = Command::new("/bin/sh")
-        .args(["-c", command])
-        .current_dir(directory)
-        .output()
-        .with_context(|| format!("start {name} command"))?;
-    if !output.stdout.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.status.success() {
-        bail!(
-            "{name} command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+fn run_hook(name: &str, command: &str, directory: &Path, verbose: bool) -> Result<()> {
+    let mut hook = Command::new("/bin/sh");
+    hook.args(["-c", command]).current_dir(directory);
+    let status = if verbose || !ui::terminal() {
+        if ui::terminal() {
+            eprintln!("  {}", style(command, 2));
+        }
+        hook.stdout(Stdio::from(std::io::stderr()))
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("start {name} command"))?
+    } else {
+        // Anonymous file keeps memory bounded and is removed even on failure.
+        let mut log = tempfile::tempfile().context("create setup log")?;
+        hook.stdout(log.try_clone()?).stderr(log.try_clone()?);
+        let (running, complete) = if name == "bootstrap" {
+            ("Setting up environment", "Environment ready")
+        } else {
+            ("Running teardown", "Teardown complete")
+        };
+        let result = progress(running, complete, || {
+            let status = hook
+                .status()
+                .with_context(|| format!("start {name} command"))?;
+            if !status.success() {
+                bail!("{name} command failed ({status})");
+            }
+            Ok(status)
+        });
+        if result.is_err() {
+            eprintln!("\n  {}\n", style(command, 2));
+            log.rewind()?;
+            io::copy(&mut log, &mut io::stderr())?;
+        }
+        result?
+    };
+    if !status.success() {
+        bail!("{name} command failed ({status})");
     }
     Ok(())
 }
 
-fn run_recorded_teardown(store: &Store, record: &Record) -> Result<()> {
+fn run_recorded_teardown(store: &Store, record: &Record, verbose: bool) -> Result<()> {
     let Some(command) = &record.teardown else {
         return Ok(());
     };
@@ -743,25 +772,7 @@ fn run_recorded_teardown(store: &Store, record: &Record) -> Result<()> {
     if !store.is_trusted(&record.repository, hash)? {
         bail!("teardown command is not trusted; use --skip-teardown to leave it running");
     }
-    run_hook("teardown", command, &record.path)
-}
-
-fn progress<T>(message: &str, completed: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    if !std::io::stderr().is_terminal() {
-        return operation();
-    }
-    let spinner = cliclack::spinner();
-    spinner.start(message);
-    match operation() {
-        Ok(value) => {
-            spinner.stop(completed);
-            Ok(value)
-        }
-        Err(error) => {
-            spinner.stop("Failed");
-            Err(error)
-        }
-    }
+    run_hook("teardown", command, &record.path, verbose)
 }
 
 fn ensure_safe_to_remove(record: &Record) -> Result<()> {

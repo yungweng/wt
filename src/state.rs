@@ -39,12 +39,26 @@ impl Store {
     }
 
     pub fn lock(&self) -> Result<Lock> {
+        self.lock_file(&self.root.join("lock"))
+    }
+
+    pub fn lock_worktree(&self, repository: &str, reference: &str) -> Result<Lock> {
+        let record = match reference.parse::<u64>() {
+            Ok(issue) => self.issue_path(repository, issue),
+            Err(_) => self.branch_path(repository, reference),
+        };
+        let directory = self.root.join("locks");
+        fs::create_dir_all(&directory)?;
+        self.lock_file(&directory.join(record.file_name().context("record has no filename")?))
+    }
+
+    fn lock_file(&self, path: &Path) -> Result<Lock> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.root.join("lock"))
+            .open(path)
             .context("open wt state lock")?;
         fs4::FileExt::lock(&file).context("lock wt state")?;
         Ok(Lock { _file: file })
