@@ -55,32 +55,38 @@ struct EnvironmentAnswers {
 
 pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
-    let repository = repository(&repo_root)?;
-    let number = issue_number(reference, &repository.slug)?;
+    let slug = repository_slug(&repo_root)?;
+    let number = issue_number(reference, &slug)?;
     let store = Store::open()?;
     let _lock = store.lock()?;
-    if let Some(record) = store.find(&repository.slug, number)? {
+    if let Some(record) = store.find(&slug, number)? {
         if record.path.exists() {
             println!("{}", record.path.display());
             return Ok(());
         }
     }
-    offer_setup(&repo_root, &repository)?;
+    offer_setup(&repo_root)?;
     let issue = progress("Reading GitHub issue", "Issue loaded", || {
-        issue(&repo_root, number, &repository.slug)
+        issue(&repo_root, number, &slug)
     })?;
-    let plan = add_plan(&repository, &issue)?;
+    let plan = add_plan(&slug, &issue)?;
     let config = Config::load(&repo_root)?;
+    let base = match &config.base {
+        Some(base) => base.clone(),
+        None => repository(&repo_root)?.default_branch.name,
+    };
     let config_hash = config.command_fingerprint()?;
-    ensure_trusted_commands(
-        &store,
-        &repository.slug,
-        &config,
-        config_hash.as_deref(),
-        no_bootstrap,
-    )?;
+    ensure_trusted_commands(&store, &slug, &config, config_hash.as_deref(), no_bootstrap)?;
     progress("Creating worktree", "Worktree ready", || {
-        install_worktree(&store, &config, &repo_root, &repository, &plan, config_hash)
+        install_worktree(
+            &store,
+            &config,
+            &repo_root,
+            &slug,
+            &base,
+            &plan,
+            config_hash,
+        )
     })?;
     run_bootstrap(&config, &plan, no_bootstrap)?;
     if std::io::stderr().is_terminal() {
@@ -90,14 +96,14 @@ pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
     Ok(())
 }
 
-fn add_plan(repository: &Repository, issue: &Issue) -> Result<AddPlan> {
+fn add_plan(repository: &str, issue: &Issue) -> Result<AddPlan> {
     let branch = branch_name(issue);
     let directory = branch.replace('/', "-");
-    let repo_name = repository.slug.rsplit('/').next().unwrap_or("repository");
+    let repo_name = repository.rsplit('/').next().unwrap_or("repository");
     Ok(AddPlan {
         issue: issue.number,
         path: config::worktree_root()?.join(repo_name).join(&directory),
-        compose_name: compose_name(&repository.slug, issue.number),
+        compose_name: compose_name(repository, issue.number),
         branch,
     })
 }
@@ -122,29 +128,19 @@ fn install_worktree(
     store: &Store,
     config: &Config,
     repo_root: &Path,
-    repository: &Repository,
+    repository: &str,
+    base: &str,
     plan: &AddPlan,
     config_hash: Option<String>,
 ) -> Result<()> {
-    let base = config
-        .base
-        .as_deref()
-        .unwrap_or(&repository.default_branch.name);
-    run_git(repo_root, ["fetch", "origin", base])?;
     let start = if local_branch_exists(repo_root, base)? {
         base.to_owned()
     } else {
+        run_git(repo_root, ["fetch", "origin", base])?;
         format!("origin/{base}")
     };
     create_worktree(repo_root, &plan.path, &plan.branch, &start)?;
-    let setup = prepare_record(
-        store,
-        config,
-        repo_root,
-        plan,
-        &repository.slug,
-        config_hash,
-    );
+    let setup = prepare_record(store, config, repo_root, plan, repository, config_hash);
     if let Err(error) = setup {
         let cleanup = run_git(
             repo_root,
@@ -266,7 +262,7 @@ pub fn init(mut options: InitOptions) -> Result<()> {
 
 pub fn trust(yes: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
-    let repository = repository(&repo_root)?;
+    let repository = repository_slug(&repo_root)?;
     let config = Config::load(&repo_root)?;
     let hash = config
         .command_fingerprint()?
@@ -289,7 +285,7 @@ pub fn trust(yes: bool) -> Result<()> {
             bail!("commands were not trusted");
         }
     }
-    Store::open()?.trust(&repository.slug, &hash)?;
+    Store::open()?.trust(&repository, &hash)?;
     if std::io::stderr().is_terminal() {
         cliclack::outro("Commands trusted")?;
     }
@@ -320,11 +316,11 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
 
 pub fn remove(issue: u64, force: bool, skip_teardown: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
-    let repository = repository(&repo_root)?;
+    let repository = repository_slug(&repo_root)?;
     let store = Store::open()?;
     let _lock = store.lock()?;
     let record = store
-        .find(&repository.slug, issue)?
+        .find(&repository, issue)?
         .with_context(|| format!("no managed worktree for issue {issue}"))?;
     if !force {
         ensure_safe_to_remove(&record)?;
@@ -335,7 +331,7 @@ pub fn remove(issue: u64, force: bool, skip_teardown: bool) -> Result<()> {
     progress("Removing worktree", "Worktree removed", || {
         remove_recorded_worktree(&repo_root, &record, force)
     })?;
-    store.delete(&repository.slug, issue)?;
+    store.delete(&record.repository, issue)?;
     if std::io::stderr().is_terminal() {
         cliclack::log::success(format!("Kept branch {}", record.branch))?;
     }
@@ -586,7 +582,7 @@ fn prompt_optional(label: &str, supplied: Option<String>) -> Result<Option<Strin
     Ok((!input.trim().is_empty()).then(|| input.trim().to_owned()))
 }
 
-fn offer_setup(repo: &Path, repository: &Repository) -> Result<()> {
+fn offer_setup(repo: &Path) -> Result<()> {
     if repo.join(".wtconfig").exists() || !std::io::stdin().is_terminal() {
         return Ok(());
     }
@@ -596,7 +592,7 @@ fn offer_setup(repo: &Path, repository: &Repository) -> Result<()> {
     if configure {
         init(InitOptions {
             root: None,
-            base: Some(repository.default_branch.name.clone()),
+            base: None,
             env: None,
             copies: Vec::new(),
             compose: false,
@@ -802,7 +798,7 @@ fn github_slug(remote: &str) -> Result<String> {
     if owner.is_empty() || repository.is_empty() {
         bail!("origin must contain a GitHub owner and repository");
     }
-    Ok(format!("{owner}/{repository}"))
+    Ok(format!("{owner}/{repository}").to_ascii_lowercase())
 }
 
 fn issue(repo_root: &Path, number: u64, slug: &str) -> Result<Issue> {
@@ -823,9 +819,15 @@ fn issue_number(reference: &str, slug: &str) -> Result<u64> {
         return Ok(number);
     }
     let prefix = format!("https://github.com/{slug}/issues/");
-    let Some(number) = reference.strip_prefix(&prefix) else {
+    let Some(path) = reference.strip_prefix("https://github.com/") else {
         bail!("expected an issue number or a {prefix}<number> URL");
     };
+    let Some((repository, number)) = path.rsplit_once("/issues/") else {
+        bail!("expected an issue number or a {prefix}<number> URL");
+    };
+    if !repository.eq_ignore_ascii_case(slug) {
+        bail!("expected an issue number or a {prefix}<number> URL");
+    }
     number.parse().context("parse issue number from URL")
 }
 
@@ -893,7 +895,7 @@ fn path_str(path: &Path) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::github_slug;
+    use super::{github_slug, issue_number};
 
     #[test]
     fn parses_github_clone_urls() {
@@ -909,6 +911,19 @@ mod tests {
             github_slug("ssh://git@github.com/acme/example.git").unwrap(),
             "acme/example"
         );
+        assert_eq!(
+            github_slug("https://github.com/Acme/Example.git").unwrap(),
+            "acme/example"
+        );
         assert!(github_slug("https://example.com/acme/example.git").is_err());
+    }
+
+    #[test]
+    fn issue_urls_match_repository_names_case_insensitively() {
+        assert_eq!(
+            issue_number("https://github.com/Acme/Example/issues/42", "acme/example").unwrap(),
+            42
+        );
+        assert!(issue_number("https://github.com/acme/other/issues/42", "acme/example").is_err());
     }
 }

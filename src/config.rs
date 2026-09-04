@@ -73,18 +73,29 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
+        let entries = entries(&path)?;
+        let all = |key: &str| {
+            entries
+                .iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, value)| value.to_owned())
+                .collect::<Vec<_>>()
+        };
+        let one = |key: &str| {
+            entries
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.to_owned())
+        };
         let config = Self {
-            base: one(&path, "wt.base")?,
-            env: one(&path, "wt.env")?.map(PathBuf::from),
-            copies: all(&path, "wt.copy")?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
-            compose: one(&path, "wt.compose")?.is_some_and(|value| is_true(&value)),
-            ports: all(&path, "wt.port")?,
-            bootstrap: one(&path, "wt.bootstrap")?,
-            teardown: one(&path, "wt.teardown")?,
-            disposable: all(&path, "wt.disposable")?
+            base: one("wt.base"),
+            env: one("wt.env").map(PathBuf::from),
+            copies: all("wt.copy").into_iter().map(PathBuf::from).collect(),
+            compose: one("wt.compose").is_some_and(|value| is_true(&value)),
+            ports: all("wt.port"),
+            bootstrap: one("wt.bootstrap"),
+            teardown: one("wt.teardown"),
+            disposable: all("wt.disposable")
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
@@ -223,6 +234,29 @@ fn quote(value: &str) -> String {
     }
 }
 
+fn entries(path: &Path) -> Result<Vec<(String, String)>> {
+    let output = Command::new("git")
+        .args(["config", "--file"])
+        .arg(path)
+        .args(["--null", "--list"])
+        .output()
+        .context("run git config")?;
+    if !output.status.success() {
+        bail!(
+            "invalid {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)?
+        .split_terminator('\0')
+        .map(|entry| {
+            let (key, value) = entry.split_once('\n').context("parse git config output")?;
+            Ok((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 fn one(path: &Path, key: &str) -> Result<Option<String>> {
     Ok(all(path, key)?.into_iter().next())
 }
@@ -255,4 +289,29 @@ fn is_true(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "true" | "yes" | "on" | "1"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::Config;
+
+    #[test]
+    fn loads_repeated_and_quoted_values_with_first_scalar_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(".wtconfig"),
+            "[WT]\n\tBase = first\n\tbase = second\n\tEnv = \"env files/local\"\n\tCopy = one\n\tcopy = \"two files\"\n\tCompose = no\n\tcompose = yes\n\tPort = API_PORT\n\tport = WEB_PORT:3000\n\tUnknown = ignored\n",
+        )
+        .unwrap();
+
+        let config = Config::load(directory.path()).unwrap();
+
+        assert_eq!(config.base.as_deref(), Some("first"));
+        assert_eq!(config.env.unwrap().to_str(), Some("env files/local"));
+        assert_eq!(config.copies, ["one", "two files"].map(PathBuf::from));
+        assert!(!config.compose);
+        assert_eq!(config.ports, ["API_PORT", "WEB_PORT:3000"]);
+    }
 }

@@ -96,7 +96,7 @@ impl Store {
     pub fn trust(&self, repository: &str, hash: &str) -> Result<()> {
         let directory = self.root.join("trust");
         fs::create_dir_all(&directory)?;
-        let path = directory.join(repository.replace('/', "--"));
+        let path = self.trust_path(repository);
         let mut hashes = fs::read_to_string(&path).unwrap_or_default();
         if !hashes.lines().any(|trusted| trusted == hash) {
             hashes.push_str(hash);
@@ -107,19 +107,41 @@ impl Store {
     }
 
     pub fn is_trusted(&self, repository: &str, hash: &str) -> Result<bool> {
-        let path = self.root.join("trust").join(repository.replace('/', "--"));
-        Ok(fs::read_to_string(path)
+        Ok(fs::read_to_string(self.trust_path(repository))
             .unwrap_or_default()
             .lines()
             .any(|trusted| trusted == hash))
     }
 
     fn record_path(&self, repository: &str, issue: u64) -> PathBuf {
-        let repository = repository.replace('/', "--");
-        self.root
-            .join("records")
-            .join(format!("{repository}--{issue}.json"))
+        matching_path(
+            &self.root.join("records"),
+            format!("{}--{issue}.json", repository.replace('/', "--")),
+        )
     }
+
+    fn trust_path(&self, repository: &str) -> PathBuf {
+        matching_path(&self.root.join("trust"), repository.replace('/', "--"))
+    }
+}
+
+fn matching_path(directory: &Path, name: String) -> PathBuf {
+    let path = directory.join(&name);
+    if path.exists() {
+        return path;
+    }
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&name)
+        })
+        .map(|entry| entry.path())
+        .unwrap_or(path)
 }
 
 fn state_root() -> Result<PathBuf> {

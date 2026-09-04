@@ -31,15 +31,80 @@ fn add_starts_from_the_local_base_branch_when_it_is_ahead() {
     fixture.write("local-setup.txt", "ready\n");
     command(&fixture.repo, "git", ["add", "local-setup.txt"]);
     command(&fixture.repo, "git", ["commit", "-m", "local setup"]);
+    let fetch_head = fixture.repo.join(".git/FETCH_HEAD");
+    assert!(!fetch_head.exists());
+
+    let output = fixture.wt(["add", "42"]);
+
+    assert_success(&output);
+    assert!(!fetch_head.exists());
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(
+        fs::read_to_string(path.join("local-setup.txt")).unwrap(),
+        "ready\n"
+    );
+}
+
+#[test]
+fn add_fetches_a_base_branch_that_is_not_local() {
+    let fixture = Fixture::new();
+    command(&fixture.repo, "git", ["checkout", "-b", "remote-only"]);
+    fixture.write("remote-only.txt", "ready\n");
+    command(&fixture.repo, "git", ["add", "remote-only.txt"]);
+    command(&fixture.repo, "git", ["commit", "-m", "remote base"]);
+    command(&fixture.repo, "git", ["push", "origin", "remote-only"]);
+    command(&fixture.repo, "git", ["checkout", "main"]);
+    command(&fixture.repo, "git", ["branch", "-D", "remote-only"]);
+    fixture.write(".wtconfig", "[wt]\n\tbase = remote-only\n");
 
     let output = fixture.wt(["add", "42"]);
 
     assert_success(&output);
     let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
     assert_eq!(
-        fs::read_to_string(path.join("local-setup.txt")).unwrap(),
+        fs::read_to_string(path.join("remote-only.txt")).unwrap(),
         "ready\n"
     );
+}
+
+#[test]
+fn existing_add_does_not_call_gh() {
+    let fixture = Fixture::new();
+    let first = fixture.wt(["add", "42"]);
+    assert_success(&first);
+    fixture.fail_gh_calls();
+
+    let second = fixture.wt(["add", "42"]);
+
+    assert_success(&second);
+    assert_eq!(second.stdout, first.stdout);
+}
+
+#[test]
+fn existing_state_matches_repository_names_case_insensitively() {
+    let fixture = Fixture::new();
+    let first = fixture.wt(["add", "42"]);
+    assert_success(&first);
+    let original = fixture.state.join("records/acme--example--42.json");
+    let record = fs::read_to_string(&original)
+        .unwrap()
+        .replace("acme/example", "Acme/Example");
+    fs::write(&original, record).unwrap();
+    fixture.fail_gh_calls();
+
+    let reused = fixture.wt(["add", "https://github.com/ACME/EXAMPLE/issues/42"]);
+    assert_success(&reused);
+    assert_success(&fixture.wt(["remove", "42"]));
+    assert!(!original.exists());
+}
+
+#[test]
+fn configured_add_only_reads_the_issue_from_gh() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    fixture.fail_gh_repo_calls();
+
+    assert_success(&fixture.wt(["add", "42"]));
 }
 
 #[test]
@@ -144,8 +209,6 @@ fn list_shows_and_remove_deletes_a_managed_worktree_but_keeps_its_branch() {
         String::from_utf8(listed.stdout).unwrap(),
         format!("42\tfix/42-handle-empty-input\t{}\n", path.display())
     );
-    write_fake_gh(&fixture.bin);
-
     let removed = fixture.wt(["remove", "42"]);
     assert_success(&removed);
     assert!(!path.exists());
@@ -321,12 +384,14 @@ fn trust_accepts_a_reviewed_config_without_rewriting_it() {
     let fixture = Fixture::new();
     let config = "[wt]\n\tbase = main\n\tbootstrap = \"printf reviewed > .reviewed\"\n";
     fixture.write(".wtconfig", config);
+    fixture.fail_gh_calls();
 
     assert_success(&fixture.wt(["trust", "--yes"]));
     assert_eq!(
         fs::read_to_string(fixture.repo.join(".wtconfig")).unwrap(),
         config
     );
+    write_fake_gh(&fixture.bin);
     let added = fixture.wt(["add", "42"]);
     assert_success(&added);
     let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
@@ -334,6 +399,17 @@ fn trust_accepts_a_reviewed_config_without_rewriting_it() {
         fs::read_to_string(path.join(".reviewed")).unwrap(),
         "reviewed"
     );
+}
+
+#[test]
+fn command_trust_matches_repository_names_case_insensitively() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt(["init", "--bootstrap", "printf ready", "--yes"]));
+    let trust = fixture.state.join("trust/acme--example");
+    fs::rename(&trust, fixture.state.join("trust/Acme--Example")).unwrap();
+    fixture.fail_gh_repo_calls();
+
+    assert_success(&fixture.wt(["add", "42"]));
 }
 
 #[test]
@@ -383,6 +459,24 @@ fn tracked_paths_cannot_be_copied_or_marked_disposable() {
             "example\n"
         );
     }
+}
+
+#[test]
+fn disposable_directory_cannot_contain_tracked_files() {
+    let fixture = Fixture::new();
+    fixture.write("generated/tracked.txt", "keep\n");
+    command(&fixture.repo, "git", ["add", "generated/tracked.txt"]);
+    command(
+        &fixture.repo,
+        "git",
+        ["commit", "-m", "tracked generated file"],
+    );
+    fixture.write(".wtconfig", "[wt]\n\tdisposable = generated\n");
+
+    let output = fixture.wt(["add", "42"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("generated/tracked.txt"));
 }
 
 #[test]
@@ -532,6 +626,14 @@ impl Fixture {
 
     fn fail_gh_calls(&self) {
         fs::write(self.bin.join("gh"), "#!/bin/sh\nexit 99\n").unwrap();
+    }
+
+    fn fail_gh_repo_calls(&self) {
+        fs::write(
+            self.bin.join("gh"),
+            "#!/bin/sh\nif [ \"$1\" = repo ]; then exit 99; fi\nprintf '{\"number\":%s,\"title\":\"Handle empty input\",\"state\":\"OPEN\",\"labels\":[{\"name\":\"bug\"}]}\\n' \"$3\"\n",
+        )
+        .unwrap();
     }
 }
 

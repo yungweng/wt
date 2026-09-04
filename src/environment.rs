@@ -62,22 +62,30 @@ fn reject_tracked_paths(config: &Config, target: &Path) -> Result<()> {
     if config.ports.iter().any(|port| port.contains(':')) {
         paths.push(PathBuf::from(PROCESS_ENV));
     }
-    for path in paths {
-        let output = Command::new("git")
-            .current_dir(target)
-            .args(["ls-files", "-z", "--"])
-            .arg(&path)
-            .output()
-            .context("check configured path with git")?;
-        if !output.status.success() {
-            bail!("cannot inspect configured path {}", path.display());
-        }
-        if !output.stdout.is_empty() {
-            bail!(
-                "configured path is tracked by Git and must not be copied or discarded: {}",
-                path.display()
-            );
-        }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let output = Command::new("git")
+        .current_dir(target)
+        .args(["ls-files", "-z", "--"])
+        .args(paths)
+        .output()
+        .context("check configured paths with git")?;
+    if !output.status.success() {
+        bail!(
+            "cannot inspect configured paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if let Some(path) = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .find(|path| !path.is_empty())
+    {
+        bail!(
+            "configured path is tracked by Git and must not be copied or discarded: {}",
+            String::from_utf8_lossy(path)
+        );
     }
     Ok(())
 }
