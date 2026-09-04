@@ -1,0 +1,209 @@
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use anyhow::{Context, Result, bail};
+
+#[derive(Default)]
+pub struct Config {
+    pub base: Option<String>,
+    pub env: Option<PathBuf>,
+    pub copies: Vec<PathBuf>,
+    pub compose: bool,
+    pub ports: Vec<String>,
+    pub bootstrap: Option<String>,
+    pub teardown: Option<String>,
+    pub disposable: Vec<PathBuf>,
+}
+
+pub fn worktree_root() -> Result<PathBuf> {
+    if let Some(root) = env::var_os("WT_WORKTREE_ROOT") {
+        return Ok(root.into());
+    }
+    let path = global_config_path()?;
+    if let Some(root) = one(&path, "wt.root")? {
+        return Ok(PathBuf::from(root));
+    }
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join("Developer/worktrees"))
+}
+
+pub fn write_worktree_root(root: &Path) -> Result<()> {
+    if !root.is_absolute() {
+        bail!("worktree root must be an absolute path");
+    }
+    let path = global_config_path()?;
+    fs::create_dir_all(path.parent().context("global config has no parent")?)?;
+    let output = Command::new("git")
+        .args(["config", "--file"])
+        .arg(&path)
+        .args(["wt.root"])
+        .arg(root)
+        .output()
+        .context("write global wt config")?;
+    if !output.status.success() {
+        bail!(
+            "cannot write {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn global_config_path() -> Result<PathBuf> {
+    if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(root).join("wt/config"));
+    }
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config/wt/config"))
+}
+
+impl Config {
+    pub fn load(repo: &Path) -> Result<Self> {
+        let path = repo.join(".wtconfig");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let config = Self {
+            base: one(&path, "wt.base")?,
+            env: one(&path, "wt.env")?.map(PathBuf::from),
+            copies: all(&path, "wt.copy")?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            compose: one(&path, "wt.compose")?.is_some_and(|value| is_true(&value)),
+            ports: all(&path, "wt.port")?,
+            bootstrap: one(&path, "wt.bootstrap")?,
+            teardown: one(&path, "wt.teardown")?,
+            disposable: all(&path, "wt.disposable")?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        };
+        config.validate_paths()?;
+        Ok(config)
+    }
+
+    pub fn copied_files(&self) -> Vec<PathBuf> {
+        let mut paths = self.env.iter().cloned().collect::<Vec<_>>();
+        for path in &self.copies {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+
+    pub fn write(&self, repo: &Path) -> Result<()> {
+        fs::write(repo.join(".wtconfig"), self.render()).context("write .wtconfig")
+    }
+
+    pub fn validate_for_write(&self) -> Result<()> {
+        self.validate_paths()?;
+        if (self.compose || !self.ports.is_empty()) && self.env.is_none() {
+            bail!("wt.compose and wt.port require --env");
+        }
+        for command in [&self.bootstrap, &self.teardown].into_iter().flatten() {
+            if command.contains(['\n', '\r']) {
+                bail!("setup commands must fit on one line");
+            }
+        }
+        Ok(())
+    }
+
+    fn render(&self) -> String {
+        let mut lines = vec!["[wt]".to_owned()];
+        push(&mut lines, "base", self.base.as_deref());
+        push(
+            &mut lines,
+            "env",
+            self.env.as_deref().and_then(Path::to_str),
+        );
+        for path in &self.copies {
+            push(&mut lines, "copy", path.to_str());
+        }
+        if self.compose {
+            lines.push("\tcompose = true".to_owned());
+        }
+        for port in &self.ports {
+            push(&mut lines, "port", Some(port));
+        }
+        push(&mut lines, "bootstrap", self.bootstrap.as_deref());
+        push(&mut lines, "teardown", self.teardown.as_deref());
+        for path in &self.disposable {
+            push(&mut lines, "disposable", path.to_str());
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    fn validate_paths(&self) -> Result<()> {
+        for path in self.copied_files().iter().chain(&self.disposable) {
+            if path.as_os_str().is_empty()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                bail!(
+                    "configured paths must stay inside the repository: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn push(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        lines.push(format!("\t{key} = {}", quote(value)));
+    }
+}
+
+fn quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_alphanumeric() || "._/-".contains(character))
+    {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+fn one(path: &Path, key: &str) -> Result<Option<String>> {
+    Ok(all(path, key)?.into_iter().next())
+}
+
+fn all(path: &Path, key: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["config", "--file"])
+        .arg(path)
+        .args(["--get-all", key])
+        .output()
+        .context("run git config")?;
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.status.success() {
+        bail!(
+            "invalid {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn is_true(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
+}
