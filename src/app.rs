@@ -58,11 +58,11 @@ pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
     let number = issue_number(reference, &repository.slug)?;
     let store = Store::open()?;
     let _lock = store.lock()?;
-    if let Some(record) = store.find(&repository.slug, number)?
-        && record.path.exists()
-    {
-        println!("{}", record.path.display());
-        return Ok(());
+    if let Some(record) = store.find(&repository.slug, number)? {
+        if record.path.exists() {
+            println!("{}", record.path.display());
+            return Ok(());
+        }
     }
     offer_setup(&repo_root, &repository)?;
     let issue = progress("Reading GitHub issue", "Issue loaded", || {
@@ -175,13 +175,15 @@ fn prepare_record(
 }
 
 fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool) -> Result<()> {
-    if let Some(command) = &config.bootstrap
-        && !skipped
-    {
-        progress("Running bootstrap", "Bootstrap complete", || {
-            run_hook("bootstrap", command, &plan.path)
-        })
-        .with_context(|| format!("bootstrap failed; worktree kept at {}", plan.path.display()))?;
+    if !skipped {
+        if let Some(command) = &config.bootstrap {
+            progress("Running bootstrap", "Bootstrap complete", || {
+                run_hook("bootstrap", command, &plan.path)
+            })
+            .with_context(|| {
+                format!("bootstrap failed; worktree kept at {}", plan.path.display())
+            })?;
+        }
     }
     Ok(())
 }

@@ -416,11 +416,12 @@ fn env_value<'a>(contents: &'a str, key: &str) -> &'a str {
 
 fn adjacent_ports() -> (TcpListener, u16) {
     for port in 20_000..60_000 {
-        if let Ok(first) = TcpListener::bind(("127.0.0.1", port))
-            && TcpListener::bind(("127.0.0.1", port + 1)).is_ok()
-            && TcpListener::bind(("127.0.0.1", port + 2)).is_ok()
-        {
-            return (first, port);
+        if let Ok(first) = TcpListener::bind(("127.0.0.1", port)) {
+            if TcpListener::bind(("127.0.0.1", port + 1)).is_ok()
+                && TcpListener::bind(("127.0.0.1", port + 2)).is_ok()
+            {
+                return (first, port);
+            }
         }
     }
     panic!("no three adjacent ports available");
