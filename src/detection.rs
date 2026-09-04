@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
@@ -51,7 +52,9 @@ struct PackageAt {
 
 pub fn detect(repo: &Path, mut config: Config) -> Result<Report> {
     let env_candidates = ignored_env_files(repo)?;
-    let env_template = select_env_template(repo, config.env.as_deref(), &env_candidates)?;
+    let tracked = tracked_files(repo)?;
+    let devbox = read_optional(&repo.join("devbox.json"))?;
+    let env_template = select_env_template(repo, config.env.as_deref(), &env_candidates, &tracked)?;
     if config.env.is_none() {
         config.env = env_candidates.first().cloned();
         if config.env.is_none() {
@@ -60,35 +63,46 @@ pub fn detect(repo: &Path, mut config: Config) -> Result<Report> {
     }
     config.copies = detected_copies(config.copies, env_candidates, config.env.as_ref());
     config.compose |= has_root_compose(repo);
-    let packages = packages(repo)?;
+    let packages = packages(repo, &tracked)?;
     let mut report = Report {
         config,
         env_template,
         ..Report::default()
     };
-    detect_development(repo, &packages, &mut report)?;
-    finish_config(repo, &packages, &mut report)?;
+    detect_development(repo, &tracked, &packages, &mut report)?;
+    finish_config(repo, &tracked, devbox.as_deref(), &packages, &mut report)?;
     Ok(report)
 }
 
-fn finish_config(repo: &Path, packages: &[PackageAt], report: &mut Report) -> Result<()> {
+fn finish_config(
+    repo: &Path,
+    tracked: &[PathBuf],
+    devbox: Option<&str>,
+    packages: &[PackageAt],
+    report: &mut Report,
+) -> Result<()> {
     if report.config.bootstrap.is_none() {
-        report.config.bootstrap = detect_bootstrap(repo, packages, &mut report.notices)?;
+        report.config.bootstrap = detect_bootstrap(repo, devbox, packages, &mut report.notices)?;
     }
     if report.config.teardown.is_none() && report.config.compose {
         report.config.teardown = Some("docker compose down --remove-orphans".to_owned());
     }
     if report.config.disposable.is_empty() {
-        report.config.disposable = detect_disposables(repo, packages)?;
+        report.config.disposable = detect_disposables(repo, tracked, devbox.is_some(), packages)?;
     }
-    add_compose_notices(repo, &mut report.notices)?;
-    add_repository_warnings(repo, &report.config, &mut report.warnings)?;
+    add_compose_notices(tracked, &mut report.notices);
+    add_repository_warnings(repo, tracked, devbox, &report.config, &mut report.warnings)?;
     report.warnings.sort();
     report.warnings.dedup();
     Ok(())
 }
 
-fn detect_development(repo: &Path, packages: &[PackageAt], report: &mut Report) -> Result<()> {
+fn detect_development(
+    repo: &Path,
+    tracked: &[PathBuf],
+    packages: &[PackageAt],
+    report: &mut Report,
+) -> Result<()> {
     if !report.config.ports.is_empty() {
         report.development = report
             .config
@@ -99,8 +113,8 @@ fn detect_development(repo: &Path, packages: &[PackageAt], report: &mut Report) 
         return Ok(());
     }
     detect_package_servers(repo, packages, report);
-    detect_vite_configs(repo, report)?;
-    detect_wrangler_configs(repo, report)?;
+    detect_vite_configs(repo, tracked, report)?;
+    detect_wrangler_configs(repo, tracked, report)?;
     detect_compose_ports(repo, report)?;
     report.config.ports.sort();
     report.config.ports.dedup();
@@ -111,12 +125,15 @@ fn detect_development(repo: &Path, packages: &[PackageAt], report: &mut Report) 
 
 fn detect_package_servers(repo: &Path, packages: &[PackageAt], report: &mut Report) {
     for package in packages {
+        let mut vite_config = None;
         for (name, script) in &package.package.scripts {
             if let Some(command) = server_command(script, "next") {
                 detect_next(name, command, &package.root, report);
             }
-            if !has_vite_config(repo, &package.root) {
-                if let Some(command) = server_command(script, "vite") {
+            if let Some(command) = server_command(script, "vite") {
+                let has_config =
+                    *vite_config.get_or_insert_with(|| has_vite_config(repo, &package.root));
+                if !has_config {
                     detect_vite(name, command, &package.root, report);
                 }
             }
@@ -226,15 +243,13 @@ enum PortArgument {
 }
 
 fn port_argument(command: &str) -> Option<PortArgument> {
-    let words = command.split_whitespace().collect::<Vec<_>>();
-    for (index, word) in words.iter().enumerate() {
+    let mut words = command.split_whitespace();
+    while let Some(word) = words.next() {
         if let Some(value) = word.strip_prefix("--port=") {
             return parse_port_argument(value);
         }
-        if matches!(*word, "-p" | "--port") {
-            return words
-                .get(index + 1)
-                .and_then(|value| parse_port_argument(value));
+        if matches!(word, "-p" | "--port") {
+            return words.next().and_then(parse_port_argument);
         }
     }
     None
@@ -252,15 +267,15 @@ fn parse_port_argument(value: &str) -> Option<PortArgument> {
     (!key.is_empty()).then(|| PortArgument::Variable(key.to_owned()))
 }
 
-fn detect_vite_configs(repo: &Path, report: &mut Report) -> Result<()> {
-    for path in tracked_files(repo)? {
+fn detect_vite_configs(repo: &Path, tracked: &[PathBuf], report: &mut Report) -> Result<()> {
+    for path in tracked {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if !name.starts_with("vite.config.") {
             continue;
         }
-        let contents = fs::read_to_string(repo.join(&path))?;
+        let contents = fs::read_to_string(repo.join(path))?;
         let ports = numeric_port_properties(&contents);
         if ports.is_empty() {
             continue;
@@ -295,12 +310,9 @@ fn numeric_port_properties(contents: &str) -> Vec<u16> {
     ports
 }
 
-fn detect_wrangler_configs(repo: &Path, report: &mut Report) -> Result<()> {
-    for path in tracked_files(repo)?
-        .into_iter()
-        .filter(|path| is_wrangler_config(path))
-    {
-        let contents = fs::read_to_string(repo.join(&path))?;
+fn detect_wrangler_configs(repo: &Path, tracked: &[PathBuf], report: &mut Report) -> Result<()> {
+    for path in tracked.iter().filter(|path| is_wrangler_config(path)) {
+        let contents = fs::read_to_string(repo.join(path))?;
         let label = format!("Wrangler ({})", path.display());
         if let Some(port) = contents.lines().find_map(wrangler_port) {
             report.development.push(format!("{label}: fixed {port}"));
@@ -342,9 +354,10 @@ fn numeric_port_property(line: &str) -> Option<u16> {
 }
 
 fn contains_true_property(contents: &str, key: &str) -> bool {
+    let prefix = format!("{key}:");
     contents.lines().any(|line| {
         line.trim()
-            .strip_prefix(&format!("{key}:"))
+            .strip_prefix(&prefix)
             .is_some_and(|value| value.trim().trim_end_matches(',') == "true")
     })
 }
@@ -418,12 +431,12 @@ fn variable_expressions(mut value: &str) -> Vec<(String, &str)> {
     variables
 }
 
-fn packages(repo: &Path) -> Result<Vec<PackageAt>> {
-    tracked_files(repo)?
-        .into_iter()
+fn packages(repo: &Path, tracked: &[PathBuf]) -> Result<Vec<PackageAt>> {
+    tracked
+        .iter()
         .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json"))
         .map(|path| {
-            let package = serde_json::from_slice(&fs::read(repo.join(&path))?)
+            let package = serde_json::from_slice(&fs::read(repo.join(path))?)
                 .with_context(|| format!("parse {}", path.display()))?;
             Ok(PackageAt {
                 root: path.parent().unwrap_or(Path::new("")).to_owned(),
@@ -435,11 +448,20 @@ fn packages(repo: &Path) -> Result<Vec<PackageAt>> {
 
 fn detect_bootstrap(
     repo: &Path,
+    devbox: Option<&str>,
     packages: &[PackageAt],
     notices: &mut Vec<String>,
 ) -> Result<Option<String>> {
-    if let Some(command) = devbox_bootstrap(repo)? {
-        return Ok(Some(command));
+    let devbox = devbox
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .context("parse devbox.json")?;
+    if devbox.as_ref().is_some_and(|value| {
+        value
+            .pointer("/shell/scripts/bootstrap")
+            .is_some_and(|script| script.is_string() || script.is_array())
+    }) {
+        return Ok(Some("devbox run bootstrap".to_owned()));
     }
     let Some(root) = packages
         .iter()
@@ -450,14 +472,14 @@ fn detect_bootstrap(
     let Some(manager) = package_manager(repo, &root.package) else {
         return Ok(None);
     };
-    if devbox_installs_dependencies(repo, &manager)? {
+    if devbox_installs_dependencies(devbox.as_ref(), &manager) {
         notices.push(format!(
             "Dependencies: handled by the Devbox init hook ({manager} install)"
         ));
         return Ok(None);
     }
     let command = install_command(&manager);
-    Ok(Some(if repo.join("devbox.json").is_file() {
+    Ok(Some(if devbox.is_some() {
         format!("devbox run -- {command}")
     } else {
         command
@@ -472,31 +494,16 @@ fn install_command(manager: &str) -> String {
     }
 }
 
-fn devbox_bootstrap(repo: &Path) -> Result<Option<String>> {
-    let Some(contents) = read_optional(&repo.join("devbox.json"))? else {
-        return Ok(None);
-    };
-    let value: serde_json::Value = serde_json::from_str(&contents).context("parse devbox.json")?;
-    Ok(value
-        .pointer("/shell/scripts/bootstrap")
-        .filter(|value| value.is_string() || value.is_array())
-        .map(|_| "devbox run bootstrap".to_owned()))
-}
-
-fn devbox_installs_dependencies(repo: &Path, manager: &str) -> Result<bool> {
-    let Some(contents) = read_optional(&repo.join("devbox.json"))? else {
-        return Ok(false);
-    };
-    let value: serde_json::Value = serde_json::from_str(&contents).context("parse devbox.json")?;
-    Ok(value
-        .pointer("/shell/init_hook")
+fn devbox_installs_dependencies(devbox: Option<&serde_json::Value>, manager: &str) -> bool {
+    let install = format!("{manager} install");
+    devbox
+        .and_then(|value| value.pointer("/shell/init_hook"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|hooks| {
-            hooks.iter().any(|hook| {
-                hook.as_str()
-                    .is_some_and(|line| line.contains(&format!("{manager} install")))
-            })
-        }))
+            hooks
+                .iter()
+                .any(|hook| hook.as_str().is_some_and(|line| line.contains(&install)))
+        })
 }
 
 fn package_manager(repo: &Path, package: &Package) -> Option<String> {
@@ -516,26 +523,31 @@ fn package_manager(repo: &Path, package: &Package) -> Option<String> {
     .map(|(_, manager)| manager.to_owned())
 }
 
-fn detect_disposables(repo: &Path, packages: &[PackageAt]) -> Result<Vec<PathBuf>> {
+fn detect_disposables(
+    repo: &Path,
+    tracked: &[PathBuf],
+    has_devbox: bool,
+    packages: &[PackageAt],
+) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    if repo.join("devbox.json").is_file() {
+    if has_devbox {
         paths.push(PathBuf::from(".devbox"));
     }
+    let mut candidates = Vec::new();
     for package in packages {
-        paths.extend(node_disposables(repo, package)?);
+        candidates.extend(node_disposable_candidates(repo, package)?);
     }
-    for root in tracked_manifest_roots(repo, "Cargo.toml")? {
-        let target = root.join("target");
-        if is_ignored(repo, &target)? {
-            paths.push(target);
-        }
+    for root in tracked_manifest_roots(tracked, "Cargo.toml") {
+        candidates.push(root.join("target"));
     }
+    let ignored = ignored_paths(repo, &candidates)?;
+    paths.extend(candidates.into_iter().filter(|path| ignored.contains(path)));
     paths.sort();
     paths.dedup();
     Ok(paths)
 }
 
-fn node_disposables(repo: &Path, package: &PackageAt) -> Result<Vec<PathBuf>> {
+fn node_disposable_candidates(repo: &Path, package: &PackageAt) -> Result<Vec<PathBuf>> {
     let mut paths = vec![package.root.join("node_modules")];
     let next = package_has(package, "next") || scripts_contain(package, "next ");
     if next {
@@ -551,14 +563,7 @@ fn node_disposables(repo: &Path, package: &PackageAt) -> Result<Vec<PathBuf>> {
     if coverage_evidence(repo, package) {
         paths.push(package.root.join("coverage"));
     }
-    paths
-        .into_iter()
-        .filter_map(|path| match is_ignored(repo, &path) {
-            Ok(true) => Some(Ok(path)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
+    Ok(paths)
 }
 
 fn package_has(package: &PackageAt, name: &str) -> bool {
@@ -601,10 +606,11 @@ fn coverage_evidence(repo: &Path, package: &PackageAt) -> bool {
             .any(|(name, script)| name.contains("coverage") || script.contains("--coverage"))
 }
 
-fn add_compose_notices(repo: &Path, notices: &mut Vec<String>) -> Result<()> {
-    let extra = tracked_files(repo)?
-        .into_iter()
+fn add_compose_notices(tracked: &[PathBuf], notices: &mut Vec<String>) {
+    let extra = tracked
+        .iter()
         .filter(|path| is_compose_path(path) && !is_root_compose_path(path))
+        .cloned()
         .collect::<Vec<_>>();
     if !extra.is_empty() {
         notices.push(format!(
@@ -612,7 +618,6 @@ fn add_compose_notices(repo: &Path, notices: &mut Vec<String>) -> Result<()> {
             display_paths(&extra)
         ));
     }
-    Ok(())
 }
 
 fn is_compose_path(path: &Path) -> bool {
@@ -633,8 +638,14 @@ fn is_root_compose_path(path: &Path) -> bool {
             .is_some_and(|name| COMPOSE_FILES.contains(&name))
 }
 
-fn add_repository_warnings(repo: &Path, config: &Config, warnings: &mut Vec<String>) -> Result<()> {
-    if devbox_uses_worktree_gopath(repo)? {
+fn add_repository_warnings(
+    repo: &Path,
+    tracked: &[PathBuf],
+    devbox: Option<&str>,
+    config: &Config,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if devbox_uses_worktree_gopath(devbox) {
         warnings.push(
             "devbox.json stores GOPATH inside .devbox; each worktree duplicates the Go cache."
                 .to_owned(),
@@ -647,7 +658,7 @@ fn add_repository_warnings(repo: &Path, config: &Config, warnings: &mut Vec<Stri
         warnings
             .push("Process-port isolation needs direnv, but direnv is not installed.".to_owned());
     }
-    add_localhost_warnings(repo, config, warnings)
+    add_localhost_warnings(repo, tracked, config, warnings)
 }
 
 fn command_exists(command: &str) -> bool {
@@ -657,9 +668,16 @@ fn command_exists(command: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn add_localhost_warnings(repo: &Path, config: &Config, warnings: &mut Vec<String>) -> Result<()> {
-    for port in process_defaults(config)? {
-        let paths = hardcoded_localhost_paths(repo, port)?;
+fn add_localhost_warnings(
+    repo: &Path,
+    tracked: &[PathBuf],
+    config: &Config,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let mut ports = process_defaults(config)?;
+    ports.sort_unstable();
+    ports.dedup();
+    for (port, paths) in hardcoded_localhost_paths(repo, tracked, &ports)? {
         if !paths.is_empty() {
             warnings.push(format!(
                 "Tracked runtime files hard-code localhost:{port}: {}. They may not follow the assigned port.",
@@ -679,36 +697,64 @@ fn process_defaults(config: &Config) -> Result<Vec<u16>> {
         .map(|ports| ports.into_iter().flatten().collect())
 }
 
-fn hardcoded_localhost_paths(repo: &Path, port: u16) -> Result<Vec<PathBuf>> {
-    let service_roots = isolated_service_roots(repo)?;
-    if service_roots.is_empty() {
-        return Ok(Vec::new());
+fn hardcoded_localhost_paths(
+    repo: &Path,
+    tracked: &[PathBuf],
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<PathBuf>>> {
+    let mut paths_by_port = BTreeMap::new();
+    let service_roots = isolated_service_roots(tracked);
+    if service_roots.is_empty() || ports.is_empty() {
+        return Ok(paths_by_port);
     }
-    let needle = format!("localhost:{port}");
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(["grep", "-l", "-z", "-F", &needle, "--"])
-        .output()?;
+    let needles = ports
+        .iter()
+        .map(|port| (*port, format!("localhost:{port}")))
+        .collect::<Vec<_>>();
+    let mut command = Command::new("git");
+    command.current_dir(repo).args(["grep", "-l", "-z", "-F"]);
+    for (_, needle) in &needles {
+        command.args(["-e", needle]);
+    }
+    let output = command.arg("--").output()?;
     if output.status.code() == Some(1) {
-        return Ok(Vec::new());
+        return Ok(paths_by_port);
     }
     if !output.status.success() {
-        bail!("cannot search for {needle}");
+        bail!("cannot search for hard-coded localhost ports");
     }
-    Ok(nul_paths(&output.stdout)?
-        .into_iter()
-        .filter(|path| {
-            is_runtime_file(path) && service_roots.iter().any(|root| path.starts_with(root))
-        })
-        .collect())
+    for path in nul_paths(&output.stdout)?.into_iter().filter(|path| {
+        is_runtime_file(path) && service_roots.iter().any(|root| path.starts_with(root))
+    }) {
+        if let [(port, _)] = needles.as_slice() {
+            paths_by_port.entry(*port).or_default().push(path);
+            continue;
+        }
+        let contents = fs::read(repo.join(&path))?;
+        for (port, needle) in &needles {
+            if contains_bytes(&contents, needle.as_bytes()) {
+                paths_by_port.entry(*port).or_default().push(path.clone());
+            }
+        }
+    }
+    Ok(paths_by_port)
 }
 
-fn isolated_service_roots(repo: &Path) -> Result<Vec<PathBuf>> {
-    Ok(tracked_files(repo)?
-        .into_iter()
+fn isolated_service_roots(tracked: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = tracked
+        .iter()
         .filter(|path| is_wrangler_config(path))
         .filter_map(|path| path.parent().map(Path::to_owned))
-        .collect())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn contains_bytes(contents: &[u8], needle: &[u8]) -> bool {
+    contents
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn is_runtime_file(path: &Path) -> bool {
@@ -810,17 +856,21 @@ fn select_env_template(
     repo: &Path,
     supplied: Option<&Path>,
     existing: &[PathBuf],
+    tracked: &[PathBuf],
 ) -> Result<Option<EnvTemplate>> {
     if supplied.is_some() || !existing.is_empty() {
         return Ok(None);
     }
-    for source in tracked_files(repo)?.into_iter().filter(|path| {
+    for source in tracked.iter().filter(|path| {
         path.parent()
             .is_some_and(|parent| parent.as_os_str().is_empty())
             && is_env_template(path)
     }) {
-        if let Some(target) = documented_env_target(repo, &source)? {
-            return Ok(Some(EnvTemplate { source, target }));
+        if let Some(target) = documented_env_target(repo, source, tracked)? {
+            return Ok(Some(EnvTemplate {
+                source: source.clone(),
+                target,
+            }));
         }
     }
     Ok(None)
@@ -837,9 +887,13 @@ fn is_env_template(path: &Path) -> bool {
         })
 }
 
-fn documented_env_target(repo: &Path, source: &Path) -> Result<Option<PathBuf>> {
+fn documented_env_target(
+    repo: &Path,
+    source: &Path,
+    tracked: &[PathBuf],
+) -> Result<Option<PathBuf>> {
     let root = source.parent().unwrap_or(Path::new(""));
-    for readme in tracked_files(repo)?.into_iter().filter(|path| {
+    for readme in tracked.iter().filter(|path| {
         path.parent() == Some(root)
             && path
                 .file_name()
@@ -886,6 +940,10 @@ fn ignored_env_files(repo: &Path) -> Result<Vec<PathBuf>> {
             "--ignored",
             "--exclude-standard",
             "-z",
+            "--",
+            ":(glob)**/.env",
+            ":(glob)**/.env.*",
+            ":(glob)**/.dev.vars",
         ],
     )?;
     let mut paths = Vec::new();
@@ -951,12 +1009,12 @@ fn has_root_compose(repo: &Path) -> bool {
     COMPOSE_FILES.iter().any(|file| repo.join(file).is_file())
 }
 
-fn tracked_manifest_roots(repo: &Path, manifest: &str) -> Result<Vec<PathBuf>> {
-    Ok(tracked_files(repo)?
-        .into_iter()
+fn tracked_manifest_roots(tracked: &[PathBuf], manifest: &str) -> Vec<PathBuf> {
+    tracked
+        .iter()
         .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some(manifest))
         .map(|path| path.parent().unwrap_or(Path::new("")).to_owned())
-        .collect())
+        .collect()
 }
 
 fn tracked_files(repo: &Path) -> Result<Vec<PathBuf>> {
@@ -975,16 +1033,40 @@ fn nul_paths(bytes: &[u8]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn is_ignored(repo: &Path, path: &Path) -> Result<bool> {
-    let status = Command::new("git")
+fn ignored_paths(repo: &Path, paths: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+    if paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut child = Command::new("git")
         .current_dir(repo)
-        .args(["check-ignore", "--quiet", "--"])
-        .arg(path)
-        .status()?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => bail!("cannot check whether {} is ignored", path.display()),
+        .args(["check-ignore", "--stdin", "-z"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run git check-ignore")?;
+    let write = child.stdin.take().map_or_else(
+        || Err(std::io::Error::other("missing git check-ignore stdin")),
+        |mut stdin| {
+            for path in paths {
+                stdin.write_all(path.as_os_str().as_encoded_bytes())?;
+                stdin.write_all(&[0])?;
+            }
+            Ok(())
+        },
+    );
+    let output = child
+        .wait_with_output()
+        .context("wait for git check-ignore")?;
+    match output.status.code() {
+        Some(0 | 1) => {
+            write.context("send paths to git check-ignore")?;
+            Ok(nul_paths(&output.stdout)?.into_iter().collect())
+        }
+        _ => bail!(
+            "cannot check ignored paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
     }
 }
 
@@ -1008,13 +1090,11 @@ fn display_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn devbox_uses_worktree_gopath(repo: &Path) -> Result<bool> {
-    Ok(
-        read_optional(&repo.join("devbox.json"))?.is_some_and(|contents| {
-            contents.contains("\"GOPATH\"")
-                && (contents.contains("$PWD/.devbox") || contents.contains("${PWD}/.devbox"))
-        }),
-    )
+fn devbox_uses_worktree_gopath(devbox: Option<&str>) -> bool {
+    devbox.is_some_and(|contents| {
+        contents.contains("\"GOPATH\"")
+            && (contents.contains("$PWD/.devbox") || contents.contains("${PWD}/.devbox"))
+    })
 }
 
 #[cfg(test)]
@@ -1053,6 +1133,33 @@ mod tests {
         assert!(is_env_candidate(Path::new(".dev.vars")));
         assert!(!is_env_candidate(Path::new(".env.example")));
         assert!(!is_env_candidate(Path::new("node_modules/pkg/.env")));
+    }
+
+    #[test]
+    fn ignored_env_discovery_limits_git_output_without_missing_nested_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        command(fixture.path(), ["init", "-q"]);
+        write(
+            fixture.path(),
+            ".gitignore",
+            ".env\n.dev.vars\napp/.env.local\napp/.env.example\nnode_modules\n",
+        );
+        for path in [
+            ".env",
+            ".dev.vars",
+            "app/.env.local",
+            "app/.env.example",
+            "node_modules/pkg/.env",
+        ] {
+            write(fixture.path(), path, "VALUE=1\n");
+        }
+
+        assert_eq!(
+            ignored_env_files(fixture.path()).unwrap(),
+            [".env", ".dev.vars", "app/.env.local"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
     }
 
     #[test]
@@ -1146,6 +1253,58 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|line| { line.contains("hard-code localhost:3000: worker/src/index.ts") })
+        );
+    }
+
+    #[test]
+    fn one_localhost_search_maps_multiple_ports_to_their_runtime_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        command(fixture.path(), ["init", "-q"]);
+        write(
+            fixture.path(),
+            "worker/wrangler.toml",
+            "name = \"worker\"\n",
+        );
+        write(
+            fixture.path(),
+            "worker/src/web.ts",
+            "const web = 'http://localhost:3000';\n",
+        );
+        write(
+            fixture.path(),
+            "worker/src/api.ts",
+            "const api = 'http://localhost:8787';\n",
+        );
+        write(
+            fixture.path(),
+            "worker/src/web.test.ts",
+            "const test = 'http://localhost:3000';\n",
+        );
+        track(
+            fixture.path(),
+            vec![
+                "worker/wrangler.toml",
+                "worker/src/web.ts",
+                "worker/src/api.ts",
+                "worker/src/web.test.ts",
+            ],
+        );
+        let config = Config {
+            ports: vec!["WEB_PORT:3000".to_owned(), "API_PORT:8787".to_owned()],
+            ..Config::default()
+        };
+
+        let report = detect(fixture.path(), config).unwrap();
+
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("localhost:3000: worker/src/web.ts")
+                && !warning.contains("web.test.ts")
+        }));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("localhost:8787: worker/src/api.ts"))
         );
     }
 
