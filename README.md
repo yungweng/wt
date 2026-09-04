@@ -38,6 +38,40 @@ make check    # Format, lint, and test
 make install  # Replace the installed wt binary
 ```
 
+## Tab completion
+
+Enable completion in your shell after installing `wt`:
+
+**Zsh:** add this to `~/.zshrc`, after your existing `compinit` setup:
+
+```zsh
+# If completion is not initialized yet: autoload -Uz compinit; compinit
+source <(COMPLETE=zsh wt)
+```
+
+**Bash:** add this to `~/.bashrc`:
+
+```bash
+source <(COMPLETE=bash wt)
+```
+
+**Fish:** put this in `~/.config/fish/completions/wt.fish` (create the
+directory if needed):
+
+```fish
+COMPLETE=fish wt | source
+```
+
+Open a new shell to activate completion. These lines generate registration
+from the installed binary, keeping it in sync after upgrades; do not replace
+them with a saved copy of the generated script.
+
+Tab suggests commands, flags, and paths. `wt add` and `wt init --base` also
+suggest local branches and cached `origin` branches without fetching.
+`wt remove` suggests managed issue numbers and standalone branch names for
+the current repository. Completion never contacts GitHub or runs setup or
+teardown commands, and it does not create or update state files.
+
 ## Start a worktree
 
 Run the setup wizard once inside a GitHub repository:

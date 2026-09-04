@@ -11,6 +11,207 @@ use std::{
 use tempfile::TempDir;
 
 #[test]
+fn completion_registers_shells_and_suggests_commands_flags_and_paths() {
+    let fixture = Fixture::new();
+    let outside = fixture._temp.path();
+    for shell in ["bash", "zsh", "fish"] {
+        let output = fixture
+            .wt_command([])
+            .current_dir(outside)
+            .env("COMPLETE", shell)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        assert!(output.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("wt"));
+    }
+    assert_eq!(fixture.complete(&["a"]), ["add"]);
+    assert!(!fixture.complete(&[""]).contains(&"trust".to_owned()));
+    assert_eq!(fixture.complete(&["add", "--no"]), ["--no-bootstrap"]);
+    assert_eq!(
+        fixture.complete(&["-v", "remove", "--skip"]),
+        ["--skip-teardown"]
+    );
+
+    fixture.write("env files/dev.env", "PORT=3000\n");
+    for option in ["--env", "--copy"] {
+        assert_eq!(
+            fixture.complete(&["init", option, "env files/d"]),
+            ["env files/dev.env"]
+        );
+    }
+    assert_eq!(fixture.complete(&["init", "--root", "env"]), ["env files/"]);
+    assert!(
+        fixture
+            .complete(&["init", "--root", "env files/d"])
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.complete(&["init", "--disposable", "env files/d"]),
+        ["env files/dev.env"]
+    );
+    assert!(!fixture.state.exists());
+}
+
+#[test]
+fn fish_completion_handles_quoted_escaped_and_empty_tokens() {
+    if Command::new("fish").arg("--version").output().is_err() {
+        eprintln!("fish is not installed; skipping shell integration test");
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.write("env files/dev.env", "PORT=3000\n");
+    let output = Command::new("fish")
+        .args([
+            "--no-config",
+            "-c",
+            r#"
+COMPLETE=fish "$WT_BINARY" | source
+complete -C "wt init --env 'env files/d"
+complete -C 'wt init --env env\ files/d'
+complete -C 'wt init --env "env files/d'
+complete -C 'wt '
+"#,
+        ])
+        .env("WT_BINARY", env!("CARGO_BIN_EXE_wt"))
+        .env("WT_STATE_HOME", &fixture.state)
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    let completions = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        completions.matches("env files/dev.env").count(),
+        3,
+        "{completions}"
+    );
+    assert!(completions.lines().any(|line| line.starts_with("add\t")));
+    assert!(!fixture.state.exists());
+}
+
+#[test]
+fn completion_filters_and_deduplicates_local_and_origin_branches() {
+    let fixture = Fixture::new();
+    command(&fixture.repo, "git", ["branch", "feat/local"]);
+    command(
+        &fixture.repo,
+        "git",
+        ["update-ref", "refs/remotes/origin/feat/local", "HEAD"],
+    );
+    command(
+        &fixture.repo,
+        "git",
+        ["update-ref", "refs/remotes/origin/feat/remote", "HEAD"],
+    );
+    command(
+        &fixture.repo,
+        "git",
+        ["update-ref", "refs/remotes/other/feat/ignored", "HEAD"],
+    );
+    command(
+        &fixture.repo,
+        "git",
+        [
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(
+        fixture.bin.join("gh"),
+        "#!/bin/sh\ntouch \"${0}-called\"\nexit 99\n",
+    )
+    .unwrap();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tbootstrap = touch hook-called\n\tteardown = touch hook-called\n",
+    );
+
+    for args in [vec!["add", "feat/"], vec!["init", "--base", "feat/"]] {
+        assert_eq!(fixture.complete(&args), ["feat/local", "feat/remote"]);
+    }
+    assert_eq!(fixture.complete(&["add", "feat/r"]), ["feat/remote"]);
+    assert!(!fixture.complete(&["add", ""]).contains(&"HEAD".to_owned()));
+    assert!(!fixture.state.exists());
+    assert!(!fixture.bin.join("gh-called").exists());
+    assert!(!fixture.repo.join("hook-called").exists());
+    assert!(!fixture.repo.join(".git/FETCH_HEAD").exists());
+}
+
+#[test]
+fn completion_suggests_only_valid_removal_targets_for_current_repository() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt(["add", "42"]));
+    assert_success(&fixture.wt(["add", "feat/local"]));
+    let record_path = fixture.state.join("records/acme--example--42.json");
+    let original = fs::read_to_string(&record_path).unwrap();
+    fs::write(
+        &record_path,
+        original.replace("acme/example", "Acme/Example"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.state.join("records/other--repo--42.json"),
+        original
+            .replace("acme/example", "other/repo")
+            .replace("\"issue\": 42", "\"issue\": 99"),
+    )
+    .unwrap();
+    let before = fs::read(&record_path).unwrap();
+    let lock_modified = fs::metadata(fixture.state.join("lock"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::write(
+        fixture.bin.join("gh"),
+        "#!/bin/sh\ntouch \"${0}-called\"\nexit 99\n",
+    )
+    .unwrap();
+
+    let targets = fixture.complete(&["remove", ""]);
+    assert!(targets.contains(&"42".to_owned()));
+    assert!(targets.contains(&"feat/local".to_owned()));
+    assert!(!targets.contains(&"99".to_owned()));
+    assert!(!targets.contains(&"fix/42-handle-empty-input".to_owned()));
+    assert_eq!(fixture.complete(&["remove", "feat/"]), ["feat/local"]);
+    assert_eq!(fixture.complete(&["remove", "4"]), ["42"]);
+    assert_eq!(fs::read(record_path).unwrap(), before);
+    assert_eq!(
+        fs::metadata(fixture.state.join("lock"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        lock_modified
+    );
+    assert!(!fixture.bin.join("gh-called").exists());
+}
+
+#[test]
+fn completion_is_silent_without_repository_or_readable_state() {
+    let fixture = Fixture::new();
+    assert!(fixture.complete(&["remove", "missing"]).is_empty());
+    assert!(!fixture.state.exists());
+    fs::create_dir_all(fixture.state.join("records")).unwrap();
+    let corrupt = fixture.state.join("records/corrupt.json");
+    fs::write(&corrupt, "not json").unwrap();
+    assert!(fixture.complete(&["remove", "missing"]).is_empty());
+    assert_eq!(fs::read_to_string(corrupt).unwrap(), "not json");
+    assert!(!fixture.state.join("lock").exists());
+
+    for subcommand in ["add", "remove"] {
+        let output = fixture
+            .completion_command(&[subcommand, "missing"])
+            .current_dir(fixture._temp.path())
+            .output()
+            .unwrap();
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn add_creates_issue_worktree_and_prints_only_its_path() {
     let fixture = Fixture::new();
     let output = fixture.wt(["add", "https://github.com/acme/example/issues/42"]);
@@ -821,6 +1022,26 @@ impl Fixture {
 
     fn wt<const N: usize>(&self, args: [&str; N]) -> Output {
         self.wt_command(args).output().unwrap()
+    }
+
+    fn completion_command(&self, words: &[&str]) -> Command {
+        let mut command = self.wt_command(["--", "wt"].into_iter().chain(words.iter().copied()));
+        command
+            .env("COMPLETE", "bash")
+            .env("_CLAP_COMPLETE_INDEX", words.len().to_string())
+            .env("_CLAP_IFS", "\n");
+        command
+    }
+
+    fn complete(&self, words: &[&str]) -> Vec<String> {
+        let output = self.completion_command(words).output().unwrap();
+        assert_success(&output);
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn wt_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Command {

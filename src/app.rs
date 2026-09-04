@@ -857,7 +857,7 @@ fn repository(repo_root: &Path) -> Result<Repository> {
     serde_json::from_slice(&output.stdout).context("parse repository details from gh")
 }
 
-fn repository_slug(repo_root: &Path) -> Result<String> {
+pub(crate) fn repository_slug(repo_root: &Path) -> Result<String> {
     let output = run(Command::new("git").current_dir(repo_root).args([
         "config",
         "--get",

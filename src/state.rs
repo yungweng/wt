@@ -32,6 +32,12 @@ pub struct Lock {
 }
 
 impl Store {
+    pub fn open_readonly() -> Result<Self> {
+        Ok(Self {
+            root: state_root()?,
+        })
+    }
+
     pub fn open() -> Result<Self> {
         let root = state_root()?;
         fs::create_dir_all(root.join("records")).context("create wt state directory")?;

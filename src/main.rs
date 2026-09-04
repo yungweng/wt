@@ -1,4 +1,5 @@
 mod app;
+mod completion;
 mod config;
 mod detection;
 mod environment;
@@ -6,7 +7,8 @@ mod state;
 mod ui;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueHint};
+use clap_complete::engine::ArgValueCompleter;
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +38,7 @@ enum Command {
     /// Create a worktree for a GitHub issue or branch
     Add {
         /// Issue number, GitHub issue URL, or branch name
+        #[arg(add = ArgValueCompleter::new(completion::branches))]
         reference: String,
         /// Create the worktree without running its bootstrap command
         #[arg(long)]
@@ -53,6 +56,7 @@ enum Command {
     /// Safely remove a worktree without deleting its branch
     Remove {
         /// Issue number or branch name
+        #[arg(add = ArgValueCompleter::new(completion::worktrees))]
         reference: String,
         /// Remove even when the worktree contains changes
         #[arg(long)]
@@ -66,16 +70,16 @@ enum Command {
 #[derive(Args)]
 struct InitArgs {
     /// Global directory that contains worktrees
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::DirPath)]
     root: Option<String>,
     /// Branch used as the starting point
-    #[arg(long)]
+    #[arg(long, add = ArgValueCompleter::new(completion::branches))]
     base: Option<String>,
     /// Primary env file copied and updated in each worktree
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::FilePath)]
     env: Option<String>,
     /// Additional file to copy; may be repeated
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::FilePath)]
     copy: Vec<String>,
     /// Add a unique COMPOSE_PROJECT_NAME to the primary env file
     #[arg(long)]
@@ -90,7 +94,7 @@ struct InitArgs {
     #[arg(long)]
     teardown: Option<String>,
     /// Generated path that may be discarded; may be repeated
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::AnyPath)]
     disposable: Vec<String>,
     /// Write and trust the supplied configuration without prompts
     #[arg(long)]
@@ -98,6 +102,13 @@ struct InitArgs {
 }
 
 fn main() {
+    clap_complete::CompleteEnv::with_factory(Cli::command)
+        .shells(clap_complete::env::Shells(&[
+            &clap_complete::env::Bash,
+            &clap_complete::env::Zsh,
+            &completion::Fish,
+        ]))
+        .complete();
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
         std::process::exit(1);
