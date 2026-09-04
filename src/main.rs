@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "wt",
     version,
-    about = "Create isolated Git worktrees from GitHub issues"
+    about = "Create isolated, ready-to-code Git worktrees"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,10 +31,10 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Create a worktree for a GitHub issue
+    /// Create a worktree for a GitHub issue or branch
     Add {
-        /// Issue number or GitHub issue URL
-        issue: String,
+        /// Issue number, GitHub issue URL, or branch name
+        reference: String,
         /// Create the worktree without running its bootstrap command
         #[arg(long)]
         no_bootstrap: bool,
@@ -50,8 +50,8 @@ enum Command {
     },
     /// Safely remove a worktree without deleting its branch
     Remove {
-        /// Issue number
-        issue: u64,
+        /// Issue number or branch name
+        reference: String,
         /// Remove even when the worktree contains changes
         #[arg(long)]
         force: bool,
@@ -122,14 +122,14 @@ fn run() -> Result<()> {
         }),
         Command::Trust { yes } => app::trust(yes),
         Command::Add {
-            issue,
+            reference,
             no_bootstrap,
-        } => app::add(&issue, no_bootstrap),
+        } => app::add(&reference, no_bootstrap),
         Command::List { porcelain, all } => app::list(porcelain, all),
         Command::Remove {
-            issue,
+            reference,
             force,
             skip_teardown,
-        } => app::remove(issue, force, skip_teardown),
+        } => app::remove(&reference, force, skip_teardown),
     }
 }

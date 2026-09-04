@@ -41,7 +41,7 @@ struct Label {
 }
 
 struct AddPlan {
-    issue: u64,
+    issue: Option<u64>,
     branch: String,
     path: PathBuf,
     compose_name: String,
@@ -53,28 +53,27 @@ struct EnvironmentAnswers {
     ports: Vec<String>,
 }
 
+enum AddTarget {
+    Issue(u64),
+    Branch(String),
+}
+
 pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let slug = repository_slug(&repo_root)?;
-    let number = issue_number(reference, &slug)?;
+    let target = add_target(reference, &slug)?;
     let store = Store::open()?;
     let _lock = store.lock()?;
-    if let Some(record) = store.find(&slug, number)? {
+    if let Some(record) = find_record(&store, &slug, &target)? {
         if record.path.exists() {
             println!("{}", record.path.display());
             return Ok(());
         }
     }
     offer_setup(&repo_root)?;
-    let issue = progress("Reading GitHub issue", "Issue loaded", || {
-        issue(&repo_root, number, &slug)
-    })?;
-    let plan = add_plan(&slug, &issue)?;
+    let plan = target_plan(&repo_root, &slug, target)?;
     let config = Config::load(&repo_root)?;
-    let base = match &config.base {
-        Some(base) => base.clone(),
-        None => repository(&repo_root)?.default_branch.name,
-    };
+    let base = base_branch(&repo_root, &config, plan.issue)?;
     let config_hash = config.command_fingerprint()?;
     ensure_trusted_commands(&store, &slug, &config, config_hash.as_deref(), no_bootstrap)?;
     progress("Creating worktree", "Worktree ready", || {
@@ -96,20 +95,59 @@ pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
     Ok(())
 }
 
-fn add_plan(repository: &str, issue: &Issue) -> Result<AddPlan> {
-    let branch = branch_name(issue);
+fn find_record(store: &Store, repository: &str, target: &AddTarget) -> Result<Option<Record>> {
+    match target {
+        AddTarget::Issue(number) => store.find_issue(repository, *number),
+        AddTarget::Branch(branch) => store.find_branch(repository, branch),
+    }
+}
+
+fn target_plan(repo: &Path, repository: &str, target: AddTarget) -> Result<AddPlan> {
+    match target {
+        AddTarget::Issue(number) => {
+            let issue = progress("Reading GitHub issue", "Issue loaded", || {
+                issue(repo, number, repository)
+            })?;
+            issue_plan(repository, &issue)
+        }
+        AddTarget::Branch(branch) => add_plan(repository, None, branch),
+    }
+}
+
+fn base_branch(repo: &Path, config: &Config, issue: Option<u64>) -> Result<String> {
+    if let Some(base) = &config.base {
+        return Ok(base.clone());
+    }
+    if issue.is_some() {
+        return Ok(repository(repo)?.default_branch.name);
+    }
+    let branch = git_output_in(repo, ["branch", "--show-current"])?;
+    if branch.is_empty() {
+        bail!("cannot create a branch from detached HEAD; configure wt.base");
+    }
+    Ok(branch)
+}
+
+fn issue_plan(repository: &str, issue: &Issue) -> Result<AddPlan> {
+    add_plan(repository, Some(issue.number), branch_name(issue))
+}
+
+fn add_plan(repository: &str, issue: Option<u64>, branch: String) -> Result<AddPlan> {
     let directory = branch.replace('/', "-");
     let repo_name = repository.rsplit('/').next().unwrap_or("repository");
     Ok(AddPlan {
-        issue: issue.number,
+        issue,
         path: config::worktree_root()?.join(repo_name).join(&directory),
-        compose_name: compose_name(repository, issue.number),
+        compose_name: compose_name(
+            repository,
+            issue.map_or(branch.as_str().to_owned(), |n| n.to_string()),
+        ),
         branch,
     })
 }
 
-fn compose_name(repository: &str, issue: u64) -> String {
-    let raw = format!("wt-{issue}-{repository}");
+fn compose_name(repository: &str, reference: String) -> String {
+    let raw = format!("wt-{reference}-{repository}");
     let mut name = String::new();
     for character in raw.chars() {
         if character.is_ascii_alphanumeric() {
@@ -133,13 +171,7 @@ fn install_worktree(
     plan: &AddPlan,
     config_hash: Option<String>,
 ) -> Result<()> {
-    let start = if local_branch_exists(repo_root, base)? {
-        base.to_owned()
-    } else {
-        run_git(repo_root, ["fetch", "origin", base])?;
-        format!("origin/{base}")
-    };
-    create_worktree(repo_root, &plan.path, &plan.branch, &start)?;
+    create_worktree(repo_root, &plan.path, &plan.branch, base)?;
     let setup = prepare_record(store, config, repo_root, plan, repository, config_hash);
     if let Err(error) = setup {
         let cleanup = run_git(
@@ -196,22 +228,52 @@ fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool) -> Result<()> {
     Ok(())
 }
 
-fn create_worktree(repo: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
+fn create_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
     if local_branch_exists(repo, branch)? {
         run_git(repo, ["worktree", "add", path_str(path)?, branch])
-    } else {
+    } else if remote_branch_exists(repo, branch)? {
+        let remote = format!("origin/{branch}");
         run_git(
             repo,
-            ["worktree", "add", "-b", branch, path_str(path)?, start],
+            [
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                branch,
+                path_str(path)?,
+                &remote,
+            ],
+        )
+    } else {
+        let start = starting_point(repo, base)?;
+        run_git(
+            repo,
+            ["worktree", "add", "-b", branch, path_str(path)?, &start],
         )
     }
 }
 
+fn starting_point(repo: &Path, base: &str) -> Result<String> {
+    if local_branch_exists(repo, base)? {
+        return Ok(base.to_owned());
+    }
+    run_git(repo, ["fetch", "origin", base])?;
+    Ok(format!("origin/{base}"))
+}
+
+fn remote_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    reference_exists(repo, &format!("refs/remotes/origin/{branch}"))
+}
+
 fn local_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
-    let reference = format!("refs/heads/{branch}");
+    reference_exists(repo, &format!("refs/heads/{branch}"))
+}
+
+fn reference_exists(repo: &Path, reference: &str) -> Result<bool> {
     Ok(Command::new("git")
         .current_dir(repo)
-        .args(["show-ref", "--verify", "--quiet", &reference])
+        .args(["show-ref", "--verify", "--quiet", reference])
         .status()?
         .success())
 }
@@ -299,14 +361,23 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
         let repository = repository_slug(&repo_root)?;
         records.retain(|record| record.repository.eq_ignore_ascii_case(&repository));
     }
-    records.sort_by_key(|record| (record.repository.clone(), record.issue));
+    records.sort_by_key(|record| {
+        (
+            record.repository.clone(),
+            record.issue.is_none(),
+            record.issue.unwrap_or_default(),
+            record.branch.clone(),
+        )
+    });
     if !porcelain && !records.is_empty() {
         println!("ISSUE\tBRANCH\tPATH");
     }
     for record in records {
         println!(
             "{}\t{}\t{}",
-            record.issue,
+            record
+                .issue
+                .map_or_else(|| "-".to_owned(), |issue| issue.to_string()),
             record.branch,
             record.path.display()
         );
@@ -314,14 +385,16 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn remove(issue: u64, force: bool, skip_teardown: bool) -> Result<()> {
+pub fn remove(reference: &str, force: bool, skip_teardown: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let repository = repository_slug(&repo_root)?;
     let store = Store::open()?;
     let _lock = store.lock()?;
-    let record = store
-        .find(&repository, issue)?
-        .with_context(|| format!("no managed worktree for issue {issue}"))?;
+    let record = match reference.parse::<u64>() {
+        Ok(issue) => store.find_issue(&repository, issue)?,
+        Err(_) => store.find_branch(&repository, reference)?,
+    }
+    .with_context(|| format!("no managed worktree for {reference}"))?;
     if !force {
         ensure_safe_to_remove(&record)?;
     }
@@ -331,7 +404,7 @@ pub fn remove(issue: u64, force: bool, skip_teardown: bool) -> Result<()> {
     progress("Removing worktree", "Worktree removed", || {
         remove_recorded_worktree(&repo_root, &record, force)
     })?;
-    store.delete(&record.repository, issue)?;
+    store.delete(&record)?;
     if std::io::stderr().is_terminal() {
         cliclack::log::success(format!("Kept branch {}", record.branch))?;
     }
@@ -831,6 +904,19 @@ fn issue_number(reference: &str, slug: &str) -> Result<u64> {
     number.parse().context("parse issue number from URL")
 }
 
+fn add_target(reference: &str, repository: &str) -> Result<AddTarget> {
+    if reference.parse::<u64>().is_ok() || reference.starts_with("https://github.com/") {
+        return Ok(AddTarget::Issue(issue_number(reference, repository)?));
+    }
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", reference])
+        .output()?;
+    if output.status.success() && String::from_utf8(output.stdout)?.trim() == reference {
+        return Ok(AddTarget::Branch(reference.to_owned()));
+    }
+    bail!("invalid branch name: {reference}")
+}
+
 fn branch_name(issue: &Issue) -> String {
     let kind = issue
         .labels
@@ -875,6 +961,11 @@ fn git_output<const N: usize>(args: [&str; N]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+fn git_output_in<const N: usize>(directory: &Path, args: [&str; N]) -> Result<String> {
+    let output = run(Command::new("git").current_dir(directory).args(args))?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
 fn run_git<const N: usize>(dir: &Path, args: [&str; N]) -> Result<()> {
     run(Command::new("git").current_dir(dir).args(args))?;
     Ok(())
@@ -895,7 +986,7 @@ fn path_str(path: &Path) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{github_slug, issue_number};
+    use super::{AddTarget, add_target, github_slug, issue_number};
 
     #[test]
     fn parses_github_clone_urls() {
@@ -925,5 +1016,14 @@ mod tests {
             42
         );
         assert!(issue_number("https://github.com/acme/other/issues/42", "acme/example").is_err());
+    }
+
+    #[test]
+    fn non_issue_references_are_branch_names() {
+        assert!(matches!(
+            add_target("feat/local-work", "acme/example").unwrap(),
+            AddTarget::Branch(branch) if branch == "feat/local-work"
+        ));
+        assert!(add_target("bad branch", "acme/example").is_err());
     }
 }

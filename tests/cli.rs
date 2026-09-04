@@ -26,6 +26,67 @@ fn add_creates_issue_worktree_and_prints_only_its_path() {
 }
 
 #[test]
+fn add_manages_a_branch_worktree_without_calling_github() {
+    let fixture = Fixture::new();
+    fixture.fail_gh_calls();
+
+    let added = fixture.wt(["add", "feat/local-work"]);
+
+    assert_success(&added);
+    let expected = fixture.worktrees.join("example/feat-local-work");
+    assert_eq!(
+        String::from_utf8(added.stdout).unwrap(),
+        format!("{}\n", expected.display())
+    );
+    assert_eq!(
+        git(&expected, ["branch", "--show-current"]),
+        "feat/local-work"
+    );
+    let listed = fixture.wt(["list", "--porcelain"]);
+    assert_success(&listed);
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap(),
+        format!("-\tfeat/local-work\t{}\n", expected.display())
+    );
+    assert_success(&fixture.wt(["remove", "feat/local-work"]));
+    assert!(!expected.exists());
+    assert_eq!(
+        git(&fixture.repo, ["branch", "--list", "feat/local-work"]),
+        "feat/local-work"
+    );
+}
+
+#[test]
+fn add_tracks_an_existing_remote_branch() {
+    let fixture = Fixture::new();
+    command(&fixture.repo, "git", ["checkout", "-b", "feat/shared"]);
+    fixture.write("shared.txt", "from remote\n");
+    command(&fixture.repo, "git", ["add", "shared.txt"]);
+    command(&fixture.repo, "git", ["commit", "-m", "shared work"]);
+    command(
+        &fixture.repo,
+        "git",
+        ["push", "-u", "origin", "feat/shared"],
+    );
+    command(&fixture.repo, "git", ["checkout", "main"]);
+    command(&fixture.repo, "git", ["branch", "-D", "feat/shared"]);
+    fixture.fail_gh_calls();
+
+    let added = fixture.wt(["add", "feat/shared"]);
+
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    assert_eq!(
+        fs::read_to_string(path.join("shared.txt")).unwrap(),
+        "from remote\n"
+    );
+    assert_eq!(
+        git(&path, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        "origin/feat/shared"
+    );
+}
+
+#[test]
 fn add_starts_from_the_local_base_branch_when_it_is_ahead() {
     let fixture = Fixture::new();
     fixture.write("local-setup.txt", "ready\n");

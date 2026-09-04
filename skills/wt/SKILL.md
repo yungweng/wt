@@ -1,28 +1,32 @@
 ---
 name: wt
-description: Use wt to create, enter, list, and remove issue-linked Git worktrees, while routing standalone worktree requests to native Git. Trigger when the user asks for a worktree or starts work from a GitHub issue.
+description: Use wt to create, locate, list, and remove managed Git worktrees for GitHub issues and standalone branches. Trigger when the user asks for a worktree or starts work from an issue.
 ---
 
 # wt worktrees
 
-Keep issue-linked worktrees isolated without forcing unrelated work into the issue tracker.
+Use `wt` for issue-linked and standalone worktrees.
 
-## Choose the worktree path
+## Before creating
 
-- Existing GitHub issue: prefer `wt` when it is installed and the repository has `.wtconfig`.
-- No existing GitHub issue: use native `git worktree` with a descriptive branch and path. A standalone worktree does not require a tracking issue.
-- Already in a suitable linked worktree: reuse it.
+Run `git status --short --branch` and `git worktree list --porcelain`. Reuse an
+existing suitable worktree and preserve unrelated changes.
 
-Inspect `git status --short --branch` and `git worktree list --porcelain` before creating anything. Preserve unrelated worktree and branch changes.
+## Create
 
-## Issue-linked work
+- Existing issue: run `wt add <issue-number-or-url>` from its repository.
+- Standalone work: run `wt add <branch>` with an exact, descriptive branch name.
 
-Run `wt add <issue-number-or-url>` from the repository that owns the issue. Use the returned path as the working directory for all subsequent work.
+Use the path printed by `wt add` as the working directory. A number or GitHub
+issue URL selects an issue; every other valid Git branch name creates a
+standalone worktree without a tracking issue.
 
-If `.wtconfig` is missing, explain that repository setup requires `wt init`; run it only when the user asks to configure the repository. If `wt` is unavailable, report that fact and use native Git when the user only needs isolation.
+`.wtconfig` is optional. Run `wt init` only when the user asks to configure
+copied files, ports, Docker Compose, bootstrap, or teardown. If `wt` is not
+installed, report that blocker.
 
-Use `wt list` to inspect managed worktrees and `wt remove <issue-number>` to remove one. Treat removal as destructive: inspect its status first and never add `--force` unless the user explicitly authorizes discarding changes.
+## List and remove
 
-## Standalone work
-
-Resolve a descriptive branch, an explicit base ref, and a non-conflicting path before running `git worktree add`. Do not create a GitHub issue merely to satisfy `wt`'s issue argument.
+Use `wt list` to inspect managed worktrees. Remove one with
+`wt remove <issue-number-or-branch>`. Inspect its status first; use `--force`
+only when the user explicitly authorizes discarding changes.

@@ -1,6 +1,6 @@
 # wt
 
-Turn a GitHub issue into an isolated, ready-to-code Git worktree.
+Turn a GitHub issue or branch into an isolated, ready-to-code Git worktree.
 
 ```console
 $ wt add 42
@@ -16,8 +16,9 @@ without deleting the branch or silently throwing away changes.
 | --- | --- |
 | `wt init` | Configure the current repository |
 | `wt add 42` | Create a worktree for issue 42 |
+| `wt add feat/my-change` | Create a worktree for a branch |
 | `wt list` | List worktrees created by `wt` |
-| `wt remove 42` | Safely remove the worktree for issue 42 |
+| `wt remove 42` | Safely remove by issue or branch |
 
 ## Install
 
@@ -27,6 +28,14 @@ You need Git, the [GitHub CLI](https://cli.github.com/), and Rust 1.85 or newer.
 ```sh
 gh auth login
 cargo install --git https://github.com/yungweng/wt
+```
+
+From a local checkout:
+
+```sh
+make          # Build target/release/wt
+make check    # Format, lint, and test
+make install  # Replace the installed wt binary
 ```
 
 ## Start a worktree
@@ -42,16 +51,22 @@ servers, Docker Compose ports, setup commands, and generated directories. It
 writes the choices to `.wtconfig`. Commit that file and any `.envrc` or
 `.gitignore` changes before creating a worktree.
 
-Then start work from an issue number or URL:
+Then start work from an issue number, URL, or branch name:
 
 ```sh
 cd "$(wt add 42)"
 # or: wt add https://github.com/acme/example-api/issues/42
+# or: wt add feat/my-change
 ```
+
+Numbers and GitHub issue URLs select issues. Every other valid Git branch name
+creates a standalone worktree, so `wt add test` needs no issue.
 
 `wt add` prints only the new path to stdout, so command substitution is safe.
 Progress and errors go to stderr. Common issue labels produce `fix/`, `feat/`,
-or `docs/` branches; other issues use `work/`.
+or `docs/` branches; other issues use `work/`. A branch name skips issue lookup
+and starts at `wt.base`, or at the current branch when no base is configured.
+If the branch already exists locally or on `origin`, `wt` checks it out.
 
 ## Configure a repository
 
@@ -114,12 +129,12 @@ npx --yes skills add yungweng/wt --skill wt --global \
   --agent claude-code --agent codex --yes
 ```
 
-The skill uses native Git for standalone worktrees, so it does not create an
-issue just to use `wt`.
+The skill uses `wt` for issue-linked and standalone worktrees. It never creates
+an issue just to create a worktree.
 
 ## Limits
 
-- GitHub issues only.
+- Issue lookup supports GitHub.com only; branch creation needs no issue.
 - macOS and Linux only.
 - Port leases reduce collisions between `wt` worktrees, but another program
   can still claim a checked port before the development server starts.
@@ -129,9 +144,7 @@ issue just to use `wt`.
 ## Development
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+make check
 ```
 
 Integration tests use local repositories and a fake `gh`; they need no network

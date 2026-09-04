@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "Create isolated Git worktrees from GitHub issues"
+description = "Create isolated, ready-to-code Git worktrees"
 repository = "https://github.com/yungweng/wt"
 
 [[bin]]

@@ -5,13 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Record {
     pub repository: String,
-    pub issue: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
     pub branch: String,
     pub path: PathBuf,
     pub ports: BTreeMap<String, u16>,
@@ -57,8 +58,23 @@ impl Store {
             .collect())
     }
 
-    pub fn find(&self, repository: &str, issue: u64) -> Result<Option<Record>> {
-        let path = self.record_path(repository, issue);
+    pub fn find_issue(&self, repository: &str, issue: u64) -> Result<Option<Record>> {
+        self.read_record(self.issue_path(repository, issue))
+    }
+
+    pub fn find_branch(&self, repository: &str, branch: &str) -> Result<Option<Record>> {
+        let record = self.read_record(self.branch_path(repository, branch))?;
+        if record.as_ref().is_some_and(|record| {
+            !record.repository.eq_ignore_ascii_case(repository)
+                || record.issue.is_some()
+                || record.branch != branch
+        }) {
+            bail!("state key collision for branch {branch}");
+        }
+        Ok(record)
+    }
+
+    fn read_record(&self, path: PathBuf) -> Result<Option<Record>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -69,14 +85,14 @@ impl Store {
     }
 
     pub fn save(&self, record: &Record) -> Result<()> {
-        let path = self.record_path(&record.repository, record.issue);
+        let path = self.record_path(record);
         let temporary = path.with_extension("json.tmp");
         fs::write(&temporary, serde_json::to_vec_pretty(record)?)?;
         fs::rename(temporary, path).context("save wt state atomically")
     }
 
-    pub fn delete(&self, repository: &str, issue: u64) -> Result<()> {
-        fs::remove_file(self.record_path(repository, issue)).context("remove wt state")
+    pub fn delete(&self, record: &Record) -> Result<()> {
+        fs::remove_file(self.record_path(record)).context("remove wt state")
     }
 
     pub fn records(&self) -> Result<Vec<Record>> {
@@ -113,16 +129,45 @@ impl Store {
             .any(|trusted| trusted == hash))
     }
 
-    fn record_path(&self, repository: &str, issue: u64) -> PathBuf {
+    fn record_path(&self, record: &Record) -> PathBuf {
+        match record.issue {
+            Some(issue) => self.issue_path(&record.repository, issue),
+            None => self.branch_path(&record.repository, &record.branch),
+        }
+    }
+
+    fn issue_path(&self, repository: &str, issue: u64) -> PathBuf {
         matching_path(
             &self.root.join("records"),
             format!("{}--{issue}.json", repository.replace('/', "--")),
         )
     }
 
+    fn branch_path(&self, repository: &str, branch: &str) -> PathBuf {
+        matching_path(
+            &self.root.join("records"),
+            format!(
+                "{}--branch-{:016x}.json",
+                repository.replace('/', "--"),
+                branch_key(branch)
+            ),
+        )
+    }
+
     fn trust_path(&self, repository: &str) -> PathBuf {
         matching_path(&self.root.join("trust"), repository.replace('/', "--"))
     }
+}
+
+fn branch_key(branch: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    branch
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
 }
 
 fn matching_path(directory: &Path, name: String) -> PathBuf {
