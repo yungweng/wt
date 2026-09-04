@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::{
     config::{self, Config},
+    detection::{self, EnvTemplate, Report},
     environment,
     state::{Record, Store},
 };
@@ -70,10 +71,14 @@ pub fn add(reference: &str, no_bootstrap: bool) -> Result<()> {
     })?;
     let plan = add_plan(&repository, &issue)?;
     let config = Config::load(&repo_root)?;
-    let config_hash = config_hash(&repo_root)?;
-    if !no_bootstrap {
-        ensure_trusted_bootstrap(&store, &repository.slug, &config, config_hash.as_deref())?;
-    }
+    let config_hash = config.command_fingerprint()?;
+    ensure_trusted_commands(
+        &store,
+        &repository.slug,
+        &config,
+        config_hash.as_deref(),
+        no_bootstrap,
+    )?;
     progress("Creating worktree", "Worktree ready", || {
         install_worktree(&store, &config, &repo_root, &repository, &plan, config_hash)
     })?;
@@ -126,7 +131,11 @@ fn install_worktree(
         .as_deref()
         .unwrap_or(&repository.default_branch.name);
     run_git(repo_root, ["fetch", "origin", base])?;
-    let start = format!("origin/{base}");
+    let start = if local_branch_exists(repo_root, base)? {
+        base.to_owned()
+    } else {
+        format!("origin/{base}")
+    };
     create_worktree(repo_root, &plan.path, &plan.branch, &start)?;
     let setup = prepare_record(
         store,
@@ -137,10 +146,13 @@ fn install_worktree(
         config_hash,
     );
     if let Err(error) = setup {
-        let _ = run_git(
+        let cleanup = run_git(
             repo_root,
             ["worktree", "remove", "--force", path_str(&plan.path)?],
         );
+        if let Err(cleanup) = cleanup {
+            bail!("{error:#}; rollback also failed: {cleanup:#}");
+        }
         return Err(error);
     }
     Ok(())
@@ -189,13 +201,7 @@ fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool) -> Result<()> {
 }
 
 fn create_worktree(repo: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
-    let reference = format!("refs/heads/{branch}");
-    let exists = Command::new("git")
-        .current_dir(repo)
-        .args(["show-ref", "--verify", "--quiet", &reference])
-        .status()?
-        .success();
-    if exists {
+    if local_branch_exists(repo, branch)? {
         run_git(repo, ["worktree", "add", path_str(path)?, branch])
     } else {
         run_git(
@@ -203,6 +209,15 @@ fn create_worktree(repo: &Path, path: &Path, branch: &str, start: &str) -> Resul
             ["worktree", "add", "-b", branch, path_str(path)?, start],
         )
     }
+}
+
+fn local_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    let reference = format!("refs/heads/{branch}");
+    Ok(Command::new("git")
+        .current_dir(repo)
+        .args(["show-ref", "--verify", "--quiet", &reference])
+        .status()?
+        .success())
 }
 
 pub struct InitOptions {
@@ -221,41 +236,41 @@ pub struct InitOptions {
 pub fn init(mut options: InitOptions) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let repository = repository(&repo_root)?;
-    configure_worktree_root(&mut options)?;
-    let config = if options.yes {
-        config_from_options(options, &repository)
-    } else {
-        interactive_config(options, &repo_root, &repository)?
-    };
-    config.validate_for_write()?;
-    config.write(&repo_root)?;
-    let hash = config_hash(&repo_root)?.context("fingerprint .wtconfig")?;
-    Store::open()?.trust(&repository.slug, &hash)?;
-    if std::io::stderr().is_terminal() {
-        cliclack::outro("Saved and trusted .wtconfig")?;
-    }
-    Ok(())
-}
-
-fn configure_worktree_root(options: &mut InitOptions) -> Result<()> {
-    if options.yes {
+    let (config, env_template) = if options.yes {
         if let Some(root) = options.root.take() {
             config::write_worktree_root(Path::new(&root))?;
         }
-        return Ok(());
+        (config_from_options(options, &repository), None)
+    } else {
+        let (root, config, template) = interactive_config(options, &repo_root, &repository)?;
+        config::write_worktree_root(&root)?;
+        (config, template)
+    };
+    config.validate_for_write()?;
+    detection::apply_changes(&repo_root, &config, env_template.as_ref())?;
+    config.write(&repo_root)?;
+    let hash = config.command_fingerprint()?;
+    if let Some(hash) = &hash {
+        Store::open()?.trust(&repository.slug, hash)?;
     }
-    let default = config::worktree_root()?;
-    let root: String = cliclack::input("Where should worktrees live?")
-        .default_input(&default.display().to_string())
-        .interact()?;
-    config::write_worktree_root(Path::new(&root))
+    if std::io::stderr().is_terminal() {
+        let message = if hash.is_some() {
+            "Saved .wtconfig and trusted its commands"
+        } else {
+            "Saved .wtconfig"
+        };
+        cliclack::outro(message)?;
+    }
+    Ok(())
 }
 
 pub fn trust(yes: bool) -> Result<()> {
     let repo_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let repository = repository(&repo_root)?;
     let config = Config::load(&repo_root)?;
-    let hash = config_hash(&repo_root)?.context("no .wtconfig to trust")?;
+    let hash = config
+        .command_fingerprint()?
+        .context(".wtconfig has no bootstrap or teardown commands to trust")?;
     if !yes {
         if !std::io::stdin().is_terminal() {
             bail!("trust confirmation needs a terminal; review the file and pass --yes");
@@ -267,16 +282,16 @@ pub fn trust(yes: bool) -> Result<()> {
             config.teardown.as_deref().unwrap_or("(none)")
         );
         cliclack::note(repo_root.join(".wtconfig").display(), commands)?;
-        if !cliclack::confirm("Trust this exact configuration?")
+        if !cliclack::confirm("Trust these commands?")
             .initial_value(false)
             .interact()?
         {
-            bail!("configuration was not trusted");
+            bail!("commands were not trusted");
         }
     }
     Store::open()?.trust(&repository.slug, &hash)?;
     if std::io::stderr().is_terminal() {
-        cliclack::outro("Configuration trusted")?;
+        cliclack::outro("Commands trusted")?;
     }
     Ok(())
 }
@@ -359,30 +374,83 @@ fn interactive_config(
     options: InitOptions,
     repo: &Path,
     repository: &Repository,
-) -> Result<Config> {
+) -> Result<(PathBuf, Config, Option<EnvTemplate>)> {
     if !std::io::stdin().is_terminal() {
         bail!("interactive setup needs a terminal; pass setup options with --yes");
     }
-    cliclack::intro(" wt setup ")?;
-    let default_base = options
-        .base
+    let root = options
+        .root
         .as_deref()
-        .unwrap_or(&repository.default_branch.name);
+        .map(PathBuf::from)
+        .unwrap_or(config::worktree_root()?);
+    let seed = config_from_options(options, repository);
+    let report = detection::detect(repo, seed)?;
+    cliclack::intro(" wt setup ")?;
+    let changes = detection::planned_changes(repo, &report.config, report.env_template.as_ref())?;
+    cliclack::note(
+        "Detected settings",
+        config_summary(&root, &report, &changes),
+    )?;
+    let question = if report.warnings.is_empty() {
+        "Use these settings? (No to customize)"
+    } else {
+        "Use these settings anyway? (No to customize)"
+    };
+    if cliclack::confirm(question)
+        .initial_value(report.warnings.is_empty())
+        .interact()?
+    {
+        return Ok((root, report.config, report.env_template));
+    }
+    customize_config(root, report, &repository.default_branch.name)
+}
+
+fn customize_config(
+    root: PathBuf,
+    detected: Report,
+    default_branch: &str,
+) -> Result<(PathBuf, Config, Option<EnvTemplate>)> {
+    let root: String = cliclack::input("Worktree root?")
+        .default_input(&root.display().to_string())
+        .interact()?;
     let base = cliclack::input("Base branch?")
-        .default_input(default_base)
+        .default_input(detected.config.base.as_deref().unwrap_or(default_branch))
         .interact()?;
-    let environment = prompt_environment(repo, options.env, options.ports, options.copies)?;
+    let environment = prompt_environment(
+        detected
+            .config
+            .env
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        detected.config.ports.clone(),
+        path_strings(detected.config.copies.clone()),
+    )?;
     let compose = cliclack::confirm("Use an isolated Docker Compose project?")
-        .initial_value(options.compose || has_compose_file(repo))
+        .initial_value(detected.config.compose)
         .interact()?;
-    let bootstrap = prompt_optional("Bootstrap command?", options.bootstrap)?;
-    let teardown = prompt_optional("Teardown command?", options.teardown)?;
+    let bootstrap = prompt_optional("Bootstrap command?", detected.config.bootstrap.clone())?;
+    let teardown = prompt_optional("Teardown command?", detected.config.teardown.clone())?;
     let disposable = prompt_list(
         "Disposable paths? Comma-separated",
-        options.disposable,
+        path_strings(detected.config.disposable.clone()),
         Vec::new(),
     )?;
-    Ok(Config {
+    let config = custom_config(base, environment, compose, bootstrap, teardown, disposable);
+    let template = detected
+        .env_template
+        .filter(|template| config.env.as_ref() == Some(&template.target));
+    Ok((PathBuf::from(root), config, template))
+}
+
+fn custom_config(
+    base: String,
+    environment: EnvironmentAnswers,
+    compose: bool,
+    bootstrap: Option<String>,
+    teardown: Option<String>,
+    disposable: Vec<String>,
+) -> Config {
+    Config {
         base: Some(base),
         env: environment.env,
         copies: environment.copies,
@@ -391,43 +459,100 @@ fn interactive_config(
         bootstrap,
         teardown,
         disposable: disposable.into_iter().map(PathBuf::from).collect(),
-    })
+    }
+}
+
+fn path_strings(paths: Vec<PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+fn config_summary(root: &Path, report: &Report, changes: &[String]) -> String {
+    let value = |value: Option<&str>, fallback: &str| value.unwrap_or(fallback).to_owned();
+    let paths = |paths: &[PathBuf]| {
+        if paths.is_empty() {
+            "None".to_owned()
+        } else {
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut summary = summary_fields(root, report, &paths, &value);
+    append_section(&mut summary, "Info", &report.notices, "");
+    append_section(
+        &mut summary,
+        "Repository setup",
+        changes,
+        "Commit these files on the base branch before creating a worktree.",
+    );
+    append_section(&mut summary, "Warnings", &report.warnings, "");
+    summary
+}
+
+fn summary_fields(
+    root: &Path,
+    report: &Report,
+    paths: &impl Fn(&[PathBuf]) -> String,
+    value: &impl Fn(Option<&str>, &str) -> String,
+) -> String {
+    let config = &report.config;
+    format!(
+        "Worktree root  {}\nBase branch    {}\nEnvironment    {}\nOther files    {}\nDevelopment    {}\nDocker Compose {}\nBootstrap      {}\nTeardown       {}\nDisposable     {}",
+        root.display(),
+        value(config.base.as_deref(), "Not detected"),
+        config
+            .env
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Not found".to_owned()),
+        paths(&config.copies),
+        if report.development.is_empty() {
+            "Not detected".to_owned()
+        } else {
+            report.development.join("\n               ")
+        },
+        if config.compose { "Yes" } else { "No" },
+        value(config.bootstrap.as_deref(), "None"),
+        value(config.teardown.as_deref(), "None"),
+        paths(&config.disposable),
+    )
+}
+
+fn append_section(summary: &mut String, title: &str, lines: &[String], footer: &str) {
+    if lines.is_empty() {
+        return;
+    }
+    summary.push_str(&format!("\n\n{title}\n• {}", lines.join("\n• ")));
+    if !footer.is_empty() {
+        summary.push_str(&format!("\n{footer}"));
+    }
 }
 
 fn prompt_environment(
-    repo: &Path,
     supplied_env: Option<String>,
     supplied_ports: Vec<String>,
     supplied_copies: Vec<String>,
 ) -> Result<EnvironmentAnswers> {
-    let candidates = ignored_env_files(repo)?;
-    let detected_env =
-        supplied_env.or_else(|| candidates.first().map(|path| path.display().to_string()));
     let env: String = cliclack::input("Primary env file? Leave empty for none")
-        .default_input(detected_env.as_deref().unwrap_or(""))
+        .default_input(supplied_env.as_deref().unwrap_or(""))
         .required(false)
         .interact()?;
-    let detected_ports = if env.is_empty() {
-        Vec::new()
-    } else {
-        environment::discover_ports(&repo.join(&env)).unwrap_or_default()
-    };
-    let detected_copies = candidates
-        .into_iter()
-        .map(|path| path.display().to_string())
-        .filter(|path| path != &env)
-        .collect();
     Ok(EnvironmentAnswers {
         env: (!env.is_empty()).then(|| PathBuf::from(&env)),
         ports: prompt_list(
             "Port variables? Comma-separated",
             supplied_ports,
-            detected_ports,
+            Vec::new(),
         )?,
         copies: prompt_list(
             "Other files to copy? Comma-separated",
             supplied_copies,
-            detected_copies,
+            Vec::new(),
         )?
         .into_iter()
         .map(PathBuf::from)
@@ -461,40 +586,6 @@ fn prompt_optional(label: &str, supplied: Option<String>) -> Result<Option<Strin
     Ok((!input.trim().is_empty()).then(|| input.trim().to_owned()))
 }
 
-fn has_compose_file(repo: &Path) -> bool {
-    [
-        "compose.yml",
-        "compose.yaml",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-    ]
-    .iter()
-    .any(|file| repo.join(file).is_file())
-}
-
-fn ignored_env_files(repo: &Path) -> Result<Vec<PathBuf>> {
-    let output = run(Command::new("git").current_dir(repo).args([
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "-z",
-    ]))?;
-    let mut paths = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| String::from_utf8(entry.to_vec()).map(PathBuf::from))
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.retain(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".env") && !name.ends_with(".example"))
-    });
-    paths.sort_by_key(|path| path != Path::new(".env"));
-    Ok(paths)
-}
-
 fn offer_setup(repo: &Path, repository: &Repository) -> Result<()> {
     if repo.join(".wtconfig").exists() || !std::io::stdin().is_terminal() {
         return Ok(());
@@ -519,30 +610,36 @@ fn offer_setup(repo: &Path, repository: &Repository) -> Result<()> {
     Ok(())
 }
 
-fn config_hash(repo: &Path) -> Result<Option<String>> {
-    if !repo.join(".wtconfig").exists() {
-        return Ok(None);
-    }
-    Ok(Some(environment::fingerprint(
-        repo,
-        Path::new(".wtconfig"),
-    )?))
-}
-
-fn ensure_trusted_bootstrap(
+fn ensure_trusted_commands(
     store: &Store,
     repository: &str,
     config: &Config,
     hash: Option<&str>,
+    no_bootstrap: bool,
 ) -> Result<()> {
-    if config.bootstrap.is_none() {
+    if (no_bootstrap || config.bootstrap.is_none()) && config.teardown.is_none() {
         return Ok(());
     }
-    let hash = hash.context("configuration commands require .wtconfig")?;
+    let hash = hash.context("configuration commands require a fingerprint")?;
     if store.is_trusted(repository, hash)? {
         return Ok(());
     }
-    bail!(".wtconfig commands are not trusted; review them and run wt trust")
+    if !std::io::stdin().is_terminal() {
+        bail!(".wtconfig commands are not trusted; review them and run wt trust --yes");
+    }
+    let commands = format!(
+        "bootstrap: {}\nteardown: {}",
+        config.bootstrap.as_deref().unwrap_or("(none)"),
+        config.teardown.as_deref().unwrap_or("(none)")
+    );
+    cliclack::note("Commands requested by .wtconfig", commands)?;
+    if !cliclack::confirm("Allow and remember these commands?")
+        .initial_value(false)
+        .interact()?
+    {
+        bail!("configuration commands were not allowed");
+    }
+    store.trust(repository, hash)
 }
 
 fn run_hook(name: &str, command: &str, directory: &Path) -> Result<()> {

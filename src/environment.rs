@@ -8,7 +8,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
+use crate::config::{Config, parse_port_spec};
+
+const PROCESS_ENV: &str = ".wt.env";
+
+struct Assignment {
+    key: String,
+    original: u16,
+    assigned: u16,
+    process: bool,
+}
 
 pub struct Prepared {
     pub ports: BTreeMap<String, u16>,
@@ -23,10 +32,14 @@ pub fn prepare(
     used_ports: &HashSet<u16>,
 ) -> Result<Prepared> {
     reject_tracked_paths(config, target)?;
-    let copied = copy_files(config, source, target)?;
+    let mut copied = copy_files(config, source, target)?;
     let assignments = assign_ports(config, source, used_ports)?;
     for path in &copied {
         rewrite_file(&target.join(path), &assignments)?;
+    }
+    if assignments.iter().any(|assignment| assignment.process) {
+        write_process_env(target, &assignments)?;
+        copied.push(PathBuf::from(PROCESS_ENV));
     }
     if config.compose {
         let env = config.env.as_ref().context("wt.compose requires wt.env")?;
@@ -35,7 +48,7 @@ pub fn prepare(
     let copied_files = fingerprints(target, &copied)?;
     let ports = assignments
         .into_iter()
-        .map(|(key, _, assigned)| (key, assigned))
+        .map(|assignment| (assignment.key, assignment.assigned))
         .collect();
     Ok(Prepared {
         ports,
@@ -44,11 +57,16 @@ pub fn prepare(
 }
 
 fn reject_tracked_paths(config: &Config, target: &Path) -> Result<()> {
-    for path in config.copied_files().iter().chain(&config.disposable) {
+    let mut paths = config.copied_files();
+    paths.extend(config.disposable.iter().cloned());
+    if config.ports.iter().any(|port| port.contains(':')) {
+        paths.push(PathBuf::from(PROCESS_ENV));
+    }
+    for path in paths {
         let output = Command::new("git")
             .current_dir(target)
             .args(["ls-files", "-z", "--"])
-            .arg(path)
+            .arg(&path)
             .output()
             .context("check configured path with git")?;
         if !output.status.success() {
@@ -88,30 +106,47 @@ fn assign_ports(
     config: &Config,
     source: &Path,
     used_ports: &HashSet<u16>,
-) -> Result<Vec<(String, u16, u16)>> {
-    let Some(env_path) = &config.env else {
-        if config.ports.is_empty() {
-            return Ok(Vec::new());
-        }
-        bail!("wt.port requires wt.env");
-    };
-    let contents = fs::read_to_string(source.join(env_path))?;
+) -> Result<Vec<Assignment>> {
+    let env = config
+        .env
+        .as_ref()
+        .map(|path| fs::read_to_string(source.join(path)))
+        .transpose()?;
     let mut unavailable = used_ports.clone();
-    let mut original_ports = HashSet::new();
+    let mut assigned_by_original = BTreeMap::new();
     let mut result = Vec::new();
-    for key in &config.ports {
-        let original = value(&contents, key)
-            .with_context(|| format!("{key} is missing from {}", env_path.display()))?
-            .parse::<u16>()
-            .with_context(|| format!("{key} must be a port number"))?;
-        if !original_ports.insert(original) {
-            bail!("configured port values must be unique; {original} is repeated");
-        }
-        let assigned = available_port(original, &unavailable)?;
+    for raw in &config.ports {
+        let spec = parse_port_spec(raw)?;
+        let original = original_port(config, env.as_deref(), &spec)?;
+        let assigned = match assigned_by_original.get(&original) {
+            Some(assigned) => *assigned,
+            None => available_port(original, &unavailable)?,
+        };
         unavailable.insert(assigned);
-        result.push((key.clone(), original, assigned));
+        assigned_by_original.insert(original, assigned);
+        result.push(Assignment {
+            key: spec.key,
+            original,
+            assigned,
+            process: spec.default.is_some(),
+        });
     }
     Ok(result)
+}
+
+fn original_port(
+    config: &Config,
+    env: Option<&str>,
+    spec: &crate::config::PortSpec,
+) -> Result<u16> {
+    if let Some(default) = spec.default {
+        return Ok(default);
+    }
+    let env_path = config.env.as_ref().context("wt.port requires wt.env")?;
+    value(env.context("wt.port requires wt.env")?, &spec.key)
+        .with_context(|| format!("{} is missing from {}", spec.key, env_path.display()))?
+        .parse::<u16>()
+        .with_context(|| format!("{} must be a port number", spec.key))
 }
 
 fn available_port(start: u16, unavailable: &HashSet<u16>) -> Result<u16> {
@@ -124,37 +159,45 @@ fn available_port(start: u16, unavailable: &HashSet<u16>) -> Result<u16> {
     bail!("no free port at or above {start}")
 }
 
-fn rewrite_file(path: &Path, assignments: &[(String, u16, u16)]) -> Result<()> {
+fn rewrite_file(path: &Path, assignments: &[Assignment]) -> Result<()> {
     let mut contents = fs::read_to_string(path)?;
-    for (key, _, assigned) in assignments {
-        contents = replace_value(&contents, key, &assigned.to_string());
+    for assignment in assignments.iter().filter(|assignment| !assignment.process) {
+        contents = replace_value(&contents, &assignment.key, &assignment.assigned.to_string());
     }
     contents = replace_local_ports(contents, assignments)?;
     fs::write(path, contents).with_context(|| format!("update {}", path.display()))
 }
 
-fn replace_local_ports(mut contents: String, assignments: &[(String, u16, u16)]) -> Result<String> {
-    for (index, (_, original, _)) in assignments.iter().enumerate() {
+fn replace_local_ports(mut contents: String, assignments: &[Assignment]) -> Result<String> {
+    for (index, assignment) in assignments.iter().enumerate() {
         let marker = format!("__WT_ASSIGNED_PORT_{index}__");
         if contents.contains(&marker) {
             bail!("env file contains reserved marker {marker}");
         }
         contents = contents.replace(
-            &format!("localhost:{original}"),
+            &format!("localhost:{}", assignment.original),
             &format!("localhost:{marker}"),
         );
         contents = contents.replace(
-            &format!("127.0.0.1:{original}"),
+            &format!("127.0.0.1:{}", assignment.original),
             &format!("127.0.0.1:{marker}"),
         );
     }
-    for (index, (_, _, assigned)) in assignments.iter().enumerate() {
+    for (index, assignment) in assignments.iter().enumerate() {
         contents = contents.replace(
             &format!("__WT_ASSIGNED_PORT_{index}__"),
-            &assigned.to_string(),
+            &assignment.assigned.to_string(),
         );
     }
     Ok(contents)
+}
+
+fn write_process_env(target: &Path, assignments: &[Assignment]) -> Result<()> {
+    let mut contents = String::from("# Generated by wt. Do not edit.\n");
+    for assignment in assignments.iter().filter(|assignment| assignment.process) {
+        contents.push_str(&format!("{}={}\n", assignment.key, assignment.assigned));
+    }
+    fs::write(target.join(PROCESS_ENV), contents).context("write .wt.env")
 }
 
 fn value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {

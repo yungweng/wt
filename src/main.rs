@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod detection;
 mod environment;
 mod state;
 
@@ -24,6 +25,7 @@ enum Command {
     /// Configure wt for the current repository
     Init(InitArgs),
     /// Trust commands in the current .wtconfig
+    #[command(hide = true)]
     Trust {
         /// Trust the reviewed file without prompting
         #[arg(long)]
@@ -76,7 +78,7 @@ struct InitArgs {
     /// Add a unique COMPOSE_PROJECT_NAME to the primary env file
     #[arg(long)]
     compose: bool,
-    /// Port variable from the primary env file; may be repeated
+    /// Env port KEY or process port KEY:DEFAULT; may be repeated
     #[arg(long)]
     port: Vec<String>,
     /// Trusted shell command run after setup

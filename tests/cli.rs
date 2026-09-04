@@ -26,6 +26,23 @@ fn add_creates_issue_worktree_and_prints_only_its_path() {
 }
 
 #[test]
+fn add_starts_from_the_local_base_branch_when_it_is_ahead() {
+    let fixture = Fixture::new();
+    fixture.write("local-setup.txt", "ready\n");
+    command(&fixture.repo, "git", ["add", "local-setup.txt"]);
+    command(&fixture.repo, "git", ["commit", "-m", "local setup"]);
+
+    let output = fixture.wt(["add", "42"]);
+
+    assert_success(&output);
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(
+        fs::read_to_string(path.join("local-setup.txt")).unwrap(),
+        "ready\n"
+    );
+}
+
+#[test]
 fn add_copies_allowed_env_files_and_rewrites_reserved_ports() {
     let fixture = Fixture::new();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -59,6 +76,58 @@ fn add_copies_allowed_env_files_and_rewrites_reserved_ports() {
     assert_eq!(
         web_env,
         format!("PUBLIC_URL=http://app.localhost:{assigned}\n")
+    );
+}
+
+#[test]
+fn process_port_creates_managed_wt_env_without_a_primary_env_file() {
+    let fixture = Fixture::new();
+    let port = unused_port();
+    fixture.write(".wtconfig", &format!("[wt]\n\tport = PORT:{port}\n"));
+
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    let contents = fs::read_to_string(path.join(".wt.env")).unwrap();
+
+    assert_eq!(env_value(&contents, "PORT"), port.to_string());
+    assert_success(&fixture.wt(["remove", "42"]));
+    assert!(!path.exists());
+}
+
+#[test]
+fn env_and_process_variables_for_the_same_service_share_one_lease() {
+    let fixture = Fixture::new();
+    let port = unused_port();
+    fixture.write(
+        ".wtconfig",
+        &format!("[wt]\n\tenv = .env\n\tport = WEB_PORT\n\tport = PORT:{port}\n"),
+    );
+    fixture.write(".env", &format!("WEB_PORT={port}\n"));
+
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    let env = fs::read_to_string(path.join(".env")).unwrap();
+    let process = fs::read_to_string(path.join(".wt.env")).unwrap();
+
+    assert_eq!(env_value(&env, "WEB_PORT"), env_value(&process, "PORT"));
+}
+
+#[test]
+fn init_with_process_port_installs_direnv_support() {
+    let fixture = Fixture::new();
+
+    let initialized = fixture.wt(["init", "--port", "PORT:3000", "--yes"]);
+
+    assert_success(&initialized);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join(".envrc")).unwrap(),
+        "dotenv_if_exists .wt.env\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join(".gitignore")).unwrap(),
+        "/.wt.env\n"
     );
 }
 
@@ -204,6 +273,37 @@ fn changed_config_command_is_blocked_before_worktree_creation() {
             .join("example/fix-42-handle-empty-input")
             .exists()
     );
+}
+
+#[test]
+fn changing_non_command_config_does_not_revoke_command_trust() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt(["init", "--bootstrap", "printf safe > .safe", "--yes"]));
+    fixture.write(".env", "READY=true\n");
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tbase = main\n\tenv = .env\n\tbootstrap = \"printf safe > .safe\"\n",
+    );
+
+    let output = fixture.wt(["add", "42"]);
+
+    assert_success(&output);
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(fs::read_to_string(path.join(".safe")).unwrap(), "safe");
+    assert_eq!(
+        fs::read_to_string(path.join(".env")).unwrap(),
+        "READY=true\n"
+    );
+}
+
+#[test]
+fn trust_is_hidden_from_normal_help() {
+    let fixture = Fixture::new();
+
+    let output = fixture.wt(["--help"]);
+
+    assert_success(&output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("  trust"));
 }
 
 #[test]

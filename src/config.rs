@@ -18,6 +18,12 @@ pub struct Config {
     pub disposable: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSpec {
+    pub key: String,
+    pub default: Option<u16>,
+}
+
 pub fn worktree_root() -> Result<PathBuf> {
     if let Some(root) = env::var_os("WT_WORKTREE_ROOT") {
         return Ok(root.into());
@@ -97,14 +103,30 @@ impl Config {
         paths
     }
 
+    pub fn command_fingerprint(&self) -> Result<Option<String>> {
+        if self.bootstrap.is_none() && self.teardown.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::to_string(&[
+            self.bootstrap.as_deref(),
+            self.teardown.as_deref(),
+        ])?))
+    }
+
     pub fn write(&self, repo: &Path) -> Result<()> {
         fs::write(repo.join(".wtconfig"), self.render()).context("write .wtconfig")
     }
 
     pub fn validate_for_write(&self) -> Result<()> {
         self.validate_paths()?;
-        if (self.compose || !self.ports.is_empty()) && self.env.is_none() {
-            bail!("wt.compose and wt.port require --env");
+        if self.compose && self.env.is_none() {
+            bail!("wt.compose requires --env");
+        }
+        for port in &self.ports {
+            let spec = parse_port_spec(port)?;
+            if spec.default.is_none() && self.env.is_none() {
+                bail!("wt.port = {port} requires --env or an explicit default such as {port}:3000");
+            }
         }
         for command in [&self.bootstrap, &self.teardown].into_iter().flatten() {
             if command.contains(['\n', '\r']) {
@@ -155,6 +177,33 @@ impl Config {
         }
         Ok(())
     }
+}
+
+pub fn parse_port_spec(value: &str) -> Result<PortSpec> {
+    let (key, default) = value
+        .split_once(':')
+        .map_or((value, None), |(key, value)| (key, Some(value)));
+    if key.is_empty()
+        || !key.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
+    {
+        bail!("invalid port variable: {value}");
+    }
+    let default = default
+        .map(|port| {
+            port.parse::<u16>()
+                .context("port default must be a number from 1 to 65535")
+        })
+        .transpose()?;
+    if default == Some(0) {
+        bail!("port default must be a number from 1 to 65535");
+    }
+    Ok(PortSpec {
+        key: key.to_owned(),
+        default,
+    })
 }
 
 fn push(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
