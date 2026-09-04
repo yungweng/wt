@@ -1,4 +1,5 @@
 mod app;
+mod cleanup;
 mod completion;
 mod config;
 mod detection;

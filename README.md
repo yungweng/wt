@@ -152,6 +152,12 @@ Bootstrap runs without holding the global state lock, so unrelated worktrees
 can be added while it runs. Adds and removals for the same worktree still wait
 for its bootstrap to finish.
 
+Normal removal shows separate timings for safety checks, teardown, generated-file
+cleanup, and Git removal. Generated-file cleanup uses at most four workers and
+waits for them to finish before removing the worktree. Symlinks are unlinked,
+not followed. Cleanup failures report the affected path and keep the state record.
+Forced removal continues to delegate directly to Git.
+
 Bootstrap time includes the repository's configured setup command. A fresh
 frontend dependency installation can take much longer than Git checkout.
 To create the worktree without installing dependencies:

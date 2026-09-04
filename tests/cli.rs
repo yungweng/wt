@@ -957,6 +957,112 @@ fn trusted_teardown_runs_before_removal() {
     );
 }
 
+#[test]
+fn remove_cleans_nested_disposable_paths_and_keeps_unrelated_worktrees() {
+    let fixture = Fixture::new();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tbase = main\n\tdisposable = generated/cache\n\tdisposable = generated\n\tdisposable = generated\n\tdisposable = absent\n",
+    );
+    let first = fixture.wt(["add", "ösalkdfjöalsk"]);
+    assert_success(&first);
+    let path = PathBuf::from(String::from_utf8(first.stdout).unwrap().trim());
+    let second = fixture.wt(["add", "keep"]);
+    assert_success(&second);
+    let other = PathBuf::from(String::from_utf8(second.stdout).unwrap().trim());
+    fs::create_dir_all(path.join("generated/cache/package/lib")).unwrap();
+    fs::write(path.join("generated/cache/package/lib/index.js"), "cached").unwrap();
+
+    let removed = fixture.wt(["remove", "ösalkdfjöalsk"]);
+
+    assert_success(&removed);
+    assert!(removed.stdout.is_empty());
+    assert!(!path.exists());
+    assert!(other.join("README.md").exists());
+    assert_eq!(
+        git(&fixture.repo, ["branch", "--list", "ösalkdfjöalsk"]),
+        "ösalkdfjöalsk"
+    );
+}
+
+#[test]
+fn remove_refuses_tracked_changes_and_unknown_ignored_files() {
+    for tracked in [false, true] {
+        let fixture = Fixture::new();
+        fixture.write(".gitignore", "private-notes\n");
+        command(&fixture.repo, "git", ["add", ".gitignore"]);
+        command(
+            &fixture.repo,
+            "git",
+            ["commit", "-m", "ignore private notes"],
+        );
+        let added = fixture.wt(["add", "42"]);
+        assert_success(&added);
+        let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+        let file = if tracked {
+            "README.md"
+        } else {
+            "private-notes"
+        };
+        fs::write(path.join(file), "keep this").unwrap();
+
+        let removed = fixture.wt(["remove", "42"]);
+
+        assert!(!removed.status.success());
+        assert!(
+            String::from_utf8_lossy(&removed.stderr).contains(if tracked {
+                "tracked changes"
+            } else {
+                "unmanaged file"
+            })
+        );
+        assert_eq!(fs::read_to_string(path.join(file)).unwrap(), "keep this");
+        assert!(
+            String::from_utf8_lossy(&fixture.wt(["list"]).stdout)
+                .contains("fix/42-handle-empty-input")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_failure_keeps_worktree_and_record_and_reports_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root bypasses the filesystem permission failure this test exercises.
+    if Command::new("id").arg("-u").output().unwrap().stdout == b"0\n" {
+        return;
+    }
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt([
+        "init",
+        "--disposable",
+        "generated",
+        "--teardown",
+        "chmod 500 generated/package/lib",
+        "--yes",
+    ]));
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    let directory = path.join("generated/package/lib");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("cache"), "cached").unwrap();
+
+    let removed = fixture.wt(["remove", "42"]);
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!removed.status.success());
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(stderr.contains("generated/package/lib"), "{stderr}");
+    assert!(!stderr.contains("Worktree removed"));
+    assert!(path.join(".git").exists());
+    assert!(
+        String::from_utf8_lossy(&fixture.wt(["list"]).stdout).contains("fix/42-handle-empty-input")
+    );
+    assert_success(&fixture.wt(["remove", "42", "--skip-teardown"]));
+    assert!(!path.exists());
+}
+
 struct Fixture {
     _temp: TempDir,
     repo: PathBuf,

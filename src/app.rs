@@ -404,14 +404,14 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) 
     }
     .with_context(|| format!("no managed worktree for {reference}"))?;
     if !force {
-        ensure_safe_to_remove(&record)?;
+        progress("Checking worktree", "Safety checks passed", || {
+            ensure_safe_to_remove(&record)
+        })?;
     }
     if !skip_teardown {
         run_recorded_teardown(&store, &record, verbose)?;
     }
-    progress("Removing worktree", "Worktree removed", || {
-        remove_recorded_worktree(&repo_root, &record, force)
-    })?;
+    remove_recorded_worktree(&repo_root, &record, force)?;
     store.delete(&record)?;
     if std::io::stderr().is_terminal() {
         eprintln!("{} Kept branch {}", style("◇", 32), record.branch);
@@ -421,13 +421,21 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) 
 
 fn remove_recorded_worktree(repo: &Path, record: &Record, force: bool) -> Result<()> {
     if force {
-        return run_git(
-            repo,
-            ["worktree", "remove", "--force", path_str(&record.path)?],
-        );
+        return progress("Removing worktree", "Worktree removed", || {
+            run_git(
+                repo,
+                ["worktree", "remove", "--force", path_str(&record.path)?],
+            )
+        });
     }
-    delete_managed_files(record)?;
-    run_git(repo, ["worktree", "remove", path_str(&record.path)?])
+    progress(
+        "Cleaning generated files",
+        "Generated files removed",
+        || delete_managed_files(record),
+    )?;
+    progress("Removing worktree", "Worktree removed", || {
+        run_git(repo, ["worktree", "remove", path_str(&record.path)?])
+    })
 }
 
 fn config_from_options(options: InitOptions, repository: &Repository) -> Config {
@@ -829,22 +837,10 @@ fn is_removable_path(path: &Path, record: &Record) -> bool {
 
 fn delete_managed_files(record: &Record) -> Result<()> {
     for path in record.copied_files.keys() {
-        fs::remove_file(record.path.join(path))?;
+        fs::remove_file(record.path.join(path))
+            .with_context(|| format!("remove {}", record.path.join(path).display()))?;
     }
-    for path in &record.disposable {
-        let path = record.path.join(path);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.file_type().is_symlink() || metadata.is_file() {
-            fs::remove_file(path)?;
-        } else if metadata.is_dir() {
-            fs::remove_dir_all(path)?;
-        }
-    }
-    Ok(())
+    crate::cleanup::remove_paths(&record.path, &record.disposable)
 }
 
 fn repository(repo_root: &Path) -> Result<Repository> {
