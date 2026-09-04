@@ -1,99 +1,61 @@
 # wt
 
-`wt` creates an isolated Git worktree from a GitHub issue and prepares it for
-development.
+Turn a GitHub issue into an isolated, ready-to-code Git worktree.
 
 ```console
 $ wt add 42
 /Users/alex/Developer/worktrees/example-api/fix-42-handle-empty-input
 ```
 
-It copies only approved files, assigns free ports, isolates Docker Compose,
-and can run a trusted setup command. There is no dashboard, daemon, or plugin
-system.
+`wt` creates the branch and can prepare everything the new worktree needs:
+approved files, free development ports, an isolated Docker Compose project,
+and a trusted setup command. When the work is done, it removes the worktree
+without deleting the branch or silently throwing away changes.
+
+| Command | What it does |
+| --- | --- |
+| `wt init` | Configure the current repository |
+| `wt add 42` | Create a worktree for issue 42 |
+| `wt list` | List worktrees created by `wt` |
+| `wt remove 42` | Safely remove the worktree for issue 42 |
 
 ## Install
 
 You need Git, the [GitHub CLI](https://cli.github.com/), and Rust 1.85 or newer.
-Process-port isolation also needs [direnv](https://direnv.net/).
-Authenticate the GitHub CLI once:
+[direnv](https://direnv.net/) is only required for process-port isolation.
 
 ```sh
 gh auth login
 cargo install --git https://github.com/yungweng/wt
 ```
 
-### Agent skill
+## Start a worktree
 
-Install the companion `wt` skill globally for Claude Code and Codex:
-
-```sh
-npx --yes skills add yungweng/wt --skill wt --global \
-  --agent claude-code --agent codex --yes
-```
-
-The skill teaches agents to use `wt` for work tied to an existing GitHub issue
-and native Git for standalone worktrees. It never requires creating an issue
-just to create a worktree.
-
-## Quick start
-
-Run the setup wizard in a GitHub repository:
+Run the setup wizard once inside a GitHub repository:
 
 ```sh
 wt init
 ```
 
-The wizard detects the base branch, ignored environment files, development
-servers, published Docker Compose ports, package-manager setup commands, and
-generated directories. It reads tracked `package.json` scripts for Next.js,
-Vite, and Wrangler. It shows whether each server uses a leased port, an
-automatic fallback, or a fixed port.
+The wizard finds the base branch, ignored environment files, development
+servers, Docker Compose ports, setup commands, and generated directories. It
+writes the choices to `.wtconfig`. Commit that file and any `.envrc` or
+`.gitignore` changes before creating a worktree.
 
-If a README tells you to copy a root `.env.example`, the wizard offers to make
-the target file. It never treats an example file as a secret. Compose files
-outside the repository root appear as information and do not enable Compose
-isolation.
-
-`wt` warns when a development port can collide, runtime files hard-code the
-original localhost port, or Devbox stores a Go cache inside each worktree. A
-warning changes the default answer to **No**.
-
-The default root is `~/Developer/worktrees`. `wt` stores another choice in
-`$XDG_CONFIG_HOME/wt/config` or `~/.config/wt/config`. For scripted setup:
-
-```sh
-wt init --root /worktrees --base main --yes
-```
-
-Create a worktree from an issue number or URL:
-
-```sh
-wt add 42
-wt add https://github.com/acme/example-api/issues/42
-```
-
-Open it directly:
+Then start work from an issue number or URL:
 
 ```sh
 cd "$(wt add 42)"
+# or: wt add https://github.com/acme/example-api/issues/42
 ```
 
-`wt add` writes only the path to stdout. Interactive progress and errors go to
-stderr, so command substitution remains safe.
+`wt add` prints only the new path to stdout, so command substitution is safe.
+Progress and errors go to stderr. Common issue labels produce `fix/`, `feat/`,
+or `docs/` branches; other issues use `work/`.
 
-List or remove managed worktrees:
+## Configure a repository
 
-```sh
-wt list
-wt remove 42
-```
-
-Removal keeps the Git branch.
-
-## Repository configuration
-
-`wt init` writes `.wtconfig` using Git's config format:
+`wt init` writes `.wtconfig` in Git's config format:
 
 ```ini
 [wt]
@@ -103,7 +65,6 @@ Removal keeps the Git branch.
     compose = true
 
     port = API_PORT
-    port = DATABASE_PORT
     port = PORT:3000
 
     bootstrap = make setup
@@ -113,108 +74,57 @@ Removal keeps the Git branch.
     disposable = web/node_modules
 ```
 
-Commit `.wtconfig` and any `.envrc` or `.gitignore` changes made by `wt init`
-on the configured base branch. `wt` starts new worktrees from that local branch
-when it exists. Do not commit the secret files named by `.wtconfig`.
+- `env` and `copy` select untracked files to copy. Paths must stay inside the
+  repository, point to regular files, and cannot be symlinks.
+- `port = KEY` rewrites a port stored in the primary env file. `KEY:DEFAULT`
+  leases a process port through `.wt.env`; this form requires direnv.
+- `compose = true` gives each worktree a unique `COMPOSE_PROJECT_NAME`.
+- `bootstrap` runs after creation; `teardown` runs before removal. `wt` asks
+  again if either trusted command changes.
+- `disposable` lists generated paths that `wt remove` may discard.
 
-### Files
+The default worktree root is `~/Developer/worktrees`. Change it with
+`wt init --root /absolute/path` or `WT_WORKTREE_ROOT`.
 
-`env` selects the primary env file. `copy` adds more files. Paths must be
-relative, must stay inside the repository, and must point to regular files.
-Symlinks are rejected.
+## Safety and automation
 
-The wizard suggests ignored `.env*` and `.dev.vars` files. It excludes
-templates, backups, dependency caches, and build output. `wt` never copies an
-unlisted file.
-
-### Ports and Compose
-
-Use `port = KEY` when `KEY` contains a numeric port in the primary env file.
-`wt` rewrites that copied file.
-
-Use `port = KEY:DEFAULT` when a server reads the port from its process
-environment. For example, Next.js needs `port = PORT:3000` because it reads
-`PORT` before loading `.env` files. `wt` writes the leased value to `.wt.env`.
-During setup, it adds these lines to the repository when needed:
+Without `--force`, `wt remove` refuses to delete a worktree with tracked
+changes, unknown files, modified copied files, or files outside `disposable`
+paths. Even forced removal keeps the Git branch.
 
 ```sh
-# .envrc
-dotenv_if_exists .wt.env
-
-# .gitignore
-/.wt.env
-```
-
-Commit both changes on the base branch before creating a worktree. `wt` starts
-at the configured value, finds a free host port, and stores a lease under
-`$XDG_STATE_HOME/wt` or `~/.local/state/wt`.
-
-References using `localhost:<port>` or `127.0.0.1:<port>` are updated in every
-copied env file. Other hosts and container ports remain unchanged.
-
-`compose = true` writes a unique `COMPOSE_PROJECT_NAME` to the primary env
-file.
-
-### Commands and trust
-
-`bootstrap` runs after setup. `teardown` runs before removal. Both use
-`/bin/sh` in the worktree.
-
-`wt init` trusts the commands it writes. If those commands change, an
-interactive `wt add` shows them and asks whether to allow and remember them.
-Changes to other settings do not revoke command trust.
-
-In non-interactive automation, review the file before running the hidden
-`wt trust --yes` command. Skip setup or teardown explicitly when needed:
-
-```sh
+wt init --root /worktrees --base main --yes
 wt add 42 --no-bootstrap
 wt remove 42 --skip-teardown
-```
-
-## Removal safety
-
-Without `--force`, `wt remove` refuses to delete:
-
-- tracked changes;
-- unknown untracked or ignored files;
-- copied files changed since creation;
-- files outside configured `disposable` paths.
-
-`disposable` is an explicit allowlist for generated data. A forced removal
-still keeps the branch:
-
-```sh
-wt remove 42 --force
-```
-
-## Automation
-
-Use stable tab-separated output:
-
-```sh
 wt list --porcelain
 wt list --all --porcelain
 ```
 
-Override storage paths when running in an isolated environment:
+`--porcelain` produces stable tab-separated output. Set `WT_STATE_HOME` to
+override state storage in isolated automation. If a setup or teardown command
+changes, review `.wtconfig` before running the hidden `wt trust --yes` command
+in a non-interactive environment.
+
+## Agent skill
+
+Install the companion skill to teach Claude Code and Codex when to use `wt`:
 
 ```sh
-WT_WORKTREE_ROOT=/tmp/worktrees \
-WT_STATE_HOME=/tmp/wt-state \
-wt add 42
+npx --yes skills add yungweng/wt --skill wt --global \
+  --agent claude-code --agent codex --yes
 ```
 
-## Branch names
+The skill uses native Git for standalone worktrees, so it does not create an
+issue just to use `wt`.
 
-`wt` combines the issue number and title. Common labels select a prefix:
+## Limits
 
-| Labels | Prefix |
-| --- | --- |
-| `bug`, `type: bug`, `type/bug` | `fix/` |
-| `feature`, `enhancement`, `type: feature` | `feat/` |
-| `documentation`, `docs` | `docs/` |
-| anything else | `work/` |
+- GitHub issues only.
+- macOS and Linux only.
+- Port leases reduce collisions between `wt` worktrees, but another program
+  can still claim a checked port before the development server starts.
+- Automatic server detection covers common Next.js, Vite, and Wrangler
+  commands, not arbitrary shell scripts or every framework configuration.
 
 ## Development
 
@@ -224,17 +134,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-Integration tests use temporary local Git repositories and a fake `gh`
-executable. They do not need network access or a GitHub account.
-
-## Limits
-
-- GitHub issues only.
-- macOS and Linux only.
-- Port leases coordinate `wt` processes. Another program can still claim a
-  checked port before the development service starts.
-- Script detection recognizes common Next.js, Vite, and Wrangler commands. It
-  does not parse arbitrary shell programs or every framework configuration.
+Integration tests use local repositories and a fake `gh`; they need no network
+access or GitHub account.
 
 ## License
 
