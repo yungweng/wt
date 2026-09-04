@@ -380,16 +380,50 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
         println!("ISSUE\tBRANCH\tPATH");
     }
     for record in records {
+        let branch = if porcelain {
+            record.branch.clone()
+        } else {
+            displayed_branch(&record)
+        };
         println!(
             "{}\t{}\t{}",
             record
                 .issue
                 .map_or_else(|| "-".to_owned(), |issue| issue.to_string()),
-            record.branch,
+            branch,
             record.path.display()
         );
     }
     Ok(())
+}
+
+fn displayed_branch(record: &Record) -> String {
+    let current = if !record.path.exists() {
+        "(missing)".to_owned()
+    } else {
+        // An explicit Git directory prevents discovery of an unrelated parent repo.
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(record.path.join(".git"))
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if branch == "HEAD" {
+                    "(detached)".to_owned()
+                } else {
+                    branch
+                }
+            }
+            _ => "(unavailable)".to_owned(),
+        }
+    };
+    if current == record.branch {
+        current
+    } else {
+        format!("{current} (managed: {})", record.branch)
+    }
 }
 
 pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) -> Result<()> {
@@ -414,7 +448,7 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) 
     remove_recorded_worktree(&repo_root, &record, force)?;
     store.delete(&record)?;
     if std::io::stderr().is_terminal() {
-        eprintln!("{} Kept branch {}", style("◇", 32), record.branch);
+        eprintln!("{} Branches kept", style("◇", 32));
     }
     Ok(())
 }
@@ -795,10 +829,31 @@ fn ensure_safe_to_remove(record: &Record) -> Result<()> {
             bail!("worktree contains tracked changes: {path}");
         }
         if !is_removable_path(Path::new(&path), record) {
+            if kind == "!!"
+                && path.ends_with('/')
+                && contains_only_directories(&record.path.join(path.trim_end_matches('/')))?
+            {
+                continue;
+            }
             bail!("worktree contains an unmanaged file: {path}");
         }
     }
     Ok(())
+}
+
+fn contains_only_directories(path: &Path) -> Result<bool> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        if !contains_only_directories(&entry.path())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn worktree_changes(path: &Path) -> Result<Vec<(String, String)>> {

@@ -938,6 +938,106 @@ fn remove_refuses_unknown_files_unless_force_is_explicit() {
 }
 
 #[test]
+fn remove_allows_ignored_empty_directory_trees() {
+    let fixture = Fixture::new();
+    fixture.write(".gitignore", "uploads/\n");
+    command(&fixture.repo, "git", ["add", ".gitignore"]);
+    command(&fixture.repo, "git", ["commit", "-m", "ignore uploads"]);
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    fs::create_dir_all(path.join("uploads/avatars/global")).unwrap();
+    assert!(git(&path, ["status", "--porcelain"]).is_empty());
+    assert!(git(&path, ["status", "--porcelain", "--ignored=matching"]).contains("!! uploads/"));
+
+    assert_success(&fixture.wt(["remove", "42"]));
+    assert!(!path.exists());
+    assert!(fixture.wt(["list", "--porcelain"]).stdout.is_empty());
+    assert_eq!(
+        git(
+            &fixture.repo,
+            ["branch", "--list", "fix/42-handle-empty-input"]
+        ),
+        "fix/42-handle-empty-input"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_protects_contents_of_ignored_directories() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let fixture = Fixture::new();
+    fixture.write(".gitignore", "uploads/\n");
+    command(&fixture.repo, "git", ["add", ".gitignore"]);
+    command(&fixture.repo, "git", ["commit", "-m", "ignore uploads"]);
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    fs::create_dir_all(path.join("uploads/nested")).unwrap();
+    let entry = path.join("uploads/nested/item");
+    fs::write(&entry, "keep").unwrap();
+    assert!(!fixture.wt(["remove", "42"]).status.success());
+    assert_eq!(fs::read_to_string(&entry).unwrap(), "keep");
+    fs::remove_file(&entry).unwrap();
+    symlink("missing", &entry).unwrap();
+    assert!(!fixture.wt(["remove", "42"]).status.success());
+    assert!(fs::symlink_metadata(&entry).unwrap().is_symlink());
+    fs::remove_file(&entry).unwrap();
+    // Bind at a short path, then move the socket into the nested worktree.
+    let socket_dir = tempfile::tempdir().unwrap();
+    let bound_socket = socket_dir.path().join("s");
+    let _listener = UnixListener::bind(&bound_socket).unwrap();
+    let socket = path.join("uploads/s");
+    fs::rename(bound_socket, &socket).unwrap();
+    assert!(!fixture.wt(["remove", "42"]).status.success());
+    assert!(socket.exists());
+}
+
+#[test]
+fn list_reports_current_branch_without_changing_managed_identity() {
+    let fixture = Fixture::new();
+    let added = fixture.wt(["add", "original"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    command(&path, "git", ["switch", "-c", "changed"]);
+    fixture.fail_gh_calls();
+    for args in [vec!["list"], vec!["list", "--all"]] {
+        let output = fixture.wt_command(args).output().unwrap();
+        assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("changed (managed: original)"));
+    }
+    assert_eq!(
+        String::from_utf8(fixture.wt(["list", "--porcelain"]).stdout).unwrap(),
+        format!("-\toriginal\t{}\n", path.display())
+    );
+    assert_eq!(fixture.complete(&["remove", "orig"]), ["original"]);
+    assert_success(&fixture.wt(["remove", "original"]));
+    for branch in ["original", "changed"] {
+        assert_eq!(git(&fixture.repo, ["branch", "--list", branch]), branch);
+    }
+}
+
+#[test]
+fn list_labels_detached_missing_and_unavailable_worktrees() {
+    let fixture = Fixture::new();
+    let added = fixture.wt(["add", "original"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    command(&path, "git", ["switch", "--detach"]);
+    let listed = fixture.wt(["list"]);
+    assert_success(&listed);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("(detached) (managed: original)"));
+    fs::remove_dir_all(&path).unwrap();
+    let listed = fixture.wt(["list"]);
+    assert_success(&listed);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("(missing) (managed: original)"));
+    fs::create_dir_all(&path).unwrap();
+    let listed = fixture.wt(["list"]);
+    assert_success(&listed);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("(unavailable) (managed: original)"));
+}
+
+#[test]
 fn trusted_teardown_runs_before_removal() {
     let fixture = Fixture::new();
     assert_success(&fixture.wt([

@@ -72,6 +72,12 @@ suggest local branches and cached `origin` branches without fetching.
 the current repository. Completion never contacts GitHub or runs setup or
 teardown commands, and it does not create or update state files.
 
+`wt list` shows each worktree's current branch, or labels it as detached,
+missing, or unavailable. If it differs from the recorded branch, a `managed:`
+annotation shows the original reference. Removal and completion still use the
+managed issue number or original standalone branch name. `wt list --porcelain`
+keeps its stable three-column format with the recorded branch.
+
 ## Start a worktree
 
 Run the setup wizard once inside a GitHub repository:
@@ -174,6 +180,11 @@ build tools and dependencies. Skipping bootstrap does not make them ready.
 Without `--force`, `wt remove` refuses to delete a worktree with tracked
 changes, unknown files, modified copied files, or files outside `disposable`
 paths. Even forced removal keeps the Git branch.
+
+Ignored directories containing only empty directories do not block removal.
+Other unmanaged ignored paths still block it, even when plain `git status`
+reports a clean worktree. Symlinks are not followed when checking for empty
+directory trees.
 
 ```sh
 wt init --root /worktrees --base main --yes
