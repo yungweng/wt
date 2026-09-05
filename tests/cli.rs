@@ -1163,6 +1163,347 @@ fn cleanup_failure_keeps_worktree_and_record_and_reports_the_path() {
     assert!(!path.exists());
 }
 
+#[test]
+fn clean_previews_then_removes_merged_worktrees_and_keeps_branches() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt(["add", "feat/merged"]));
+    let path = fixture.worktrees.join("example/feat-merged");
+    fs::write(path.join("feature"), "finished\n").unwrap();
+    command(&path, "git", ["add", "feature"]);
+    command(&path, "git", ["commit", "-m", "feature"]);
+    let head = git(&path, ["rev-parse", "HEAD"]);
+    command(&fixture.repo, "git", ["merge", "--ff-only", "feat/merged"]);
+
+    let preview = fixture.wt(["clean", "--dry-run"]);
+    assert_success(&preview);
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(text.contains("REMOVE\tfeat/merged\t"), "{text}");
+    assert!(text.contains("merged into main"), "{text}");
+    assert!(path.join("feature").exists());
+    let unconfirmed = fixture
+        .wt_command(["clean"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!unconfirmed.status.success());
+    assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("needs confirmation"));
+    assert!(path.exists());
+
+    assert_success(&fixture.wt(["clean", "--yes"]));
+    assert!(!path.exists());
+    assert_eq!(git(&fixture.repo, ["rev-parse", "feat/merged"]), head);
+    assert!(fixture.wt(["list", "--porcelain"]).stdout.is_empty());
+}
+
+#[test]
+fn clean_skips_locked_worktrees_before_teardown_or_generated_file_cleanup() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n\tdisposable = generated\n\tteardown = touch generated/teardown-ran\n");
+    assert_success(&fixture.wt(["trust", "--yes"]));
+    assert_success(&fixture.wt(["add", "feat/locked"]));
+    let path = fixture.worktrees.join("example/feat-locked");
+    fs::create_dir(path.join("generated")).unwrap();
+    fs::write(path.join("generated/keep"), "cache\n").unwrap();
+    command(
+        &fixture.repo,
+        "git",
+        ["worktree", "lock", path.to_str().unwrap()],
+    );
+
+    let preview = fixture.wt(["clean", "--dry-run"]);
+    assert_success(&preview);
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(text.contains("SKIP\tfeat/locked\t"), "{text}");
+    assert!(text.contains("locked"), "{text}");
+    assert_success(&fixture.wt(["clean", "--yes"]));
+    assert!(path.join("generated/keep").exists());
+    assert!(!path.join("generated/teardown-ran").exists());
+}
+
+#[test]
+fn clean_without_saved_worktrees_does_not_create_state() {
+    let fixture = Fixture::new();
+    fixture.fail_gh_calls();
+    for args in [["clean", "--dry-run"], ["clean", "--yes"]] {
+        let output = fixture.wt(args);
+        assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("No managed worktrees"));
+        assert!(!fixture.state.exists());
+    }
+}
+
+#[test]
+fn clean_preserves_tracked_untracked_ignored_and_changed_copied_files() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n\tenv = .env\n");
+    fixture.write(".env", "SECRET=original\n");
+    fixture.write(".gitignore", "ignored\n.env\n.wtconfig\n");
+    command(&fixture.repo, "git", ["add", ".gitignore"]);
+    command(&fixture.repo, "git", ["commit", "-m", "ignore local files"]);
+    for (branch, file, contents) in [
+        ("tracked", "README.md", "unfinished tracked work\n"),
+        ("untracked", "notes", "unfinished notes\n"),
+        ("ignored", "ignored", "important ignored work\n"),
+        ("copied", ".env", "SECRET=changed\n"),
+    ] {
+        assert_success(&fixture.wt(["add", branch]));
+        fs::write(
+            fixture.worktrees.join("example").join(branch).join(file),
+            contents,
+        )
+        .unwrap();
+    }
+    assert_success(&fixture.wt(["add", "safe"]));
+    let output = fixture.wt(["clean", "--yes"]);
+    assert_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    for branch in ["tracked", "untracked", "ignored", "copied"] {
+        assert!(text.contains(&format!("SKIP\t{branch}\t")), "{text}");
+        assert!(fixture.worktrees.join("example").join(branch).exists());
+    }
+    assert!(!fixture.worktrees.join("example/safe").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.worktrees.join("example/copied/.env")).unwrap(),
+        "SECRET=changed\n"
+    );
+}
+
+#[test]
+fn clean_requires_an_exact_merged_pr_match_for_squash_merges() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    assert_success(&fixture.wt(["add", "feat/squashed"]));
+    let path = fixture.worktrees.join("example/feat-squashed");
+    for message in ["first", "second"] {
+        fs::write(path.join("feature"), message).unwrap();
+        command(&path, "git", ["add", "feature"]);
+        command(&path, "git", ["commit", "-m", message]);
+    }
+    let head = git(&path, ["rev-parse", "HEAD"]);
+    command(&fixture.repo, "git", ["merge", "--squash", "feat/squashed"]);
+    command(&fixture.repo, "git", ["commit", "-m", "squash feature"]);
+    fixture.fail_gh_calls();
+    let unavailable = fixture.wt(["clean", "--yes"]);
+    assert_success(&unavailable);
+    assert!(String::from_utf8_lossy(&unavailable.stdout).contains("cannot verify merged PRs"));
+    assert!(path.exists());
+    fs::write(
+        fixture.bin.join("gh"),
+        "#!/bin/sh\ncat \"${0%/*}/prs.json\"\n",
+    )
+    .unwrap();
+    let merged = serde_json::json!({
+        "number": 123, "state": "MERGED", "headRefName": "feat/squashed",
+        "headRefOid": head, "baseRefName": "main", "isCrossRepository": false,
+    });
+    for (field, value) in [
+        ("state", serde_json::json!("CLOSED")),
+        ("headRefName", serde_json::json!("another-branch")),
+        (
+            "headRefOid",
+            serde_json::json!(git(&fixture.repo, ["rev-parse", "HEAD"])),
+        ),
+        ("baseRefName", serde_json::json!("release")),
+        ("isCrossRepository", serde_json::json!(true)),
+    ] {
+        let mut rejected = merged.clone();
+        rejected[field] = value;
+        fs::write(
+            fixture.bin.join("prs.json"),
+            serde_json::to_vec(&vec![rejected]).unwrap(),
+        )
+        .unwrap();
+        let output = fixture.wt(["clean", "--yes"]);
+        assert_success(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("SKIP\tfeat/squashed\t"),
+            "{field}"
+        );
+        assert!(path.exists(), "{field}");
+    }
+    fs::write(
+        fixture.bin.join("prs.json"),
+        serde_json::to_vec(&vec![merged]).unwrap(),
+    )
+    .unwrap();
+    let preview = fixture.wt(["clean", "--dry-run"]);
+    assert_success(&preview);
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("merged PR #123 into main"));
+
+    // Reusing the branch for more work must invalidate the old merged PR.
+    command(
+        &path,
+        "git",
+        ["commit", "--allow-empty", "-m", "new work after merge"],
+    );
+    assert_success(&fixture.wt(["clean", "--yes"]));
+    assert!(path.exists());
+    command(&path, "git", ["switch", "--detach", &head]);
+    command(
+        &fixture.repo,
+        "git",
+        ["branch", "-f", "feat/squashed", &head],
+    );
+    command(&path, "git", ["switch", "feat/squashed"]);
+    assert_success(&fixture.wt(["clean", "--yes"]));
+    assert!(!path.exists());
+    assert_eq!(git(&fixture.repo, ["rev-parse", "feat/squashed"]), head);
+}
+
+#[test]
+fn clean_skips_current_base_detached_switched_and_missing_worktrees() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    command(&fixture.repo, "git", ["switch", "-c", "caller"]);
+    for branch in ["main", "current", "detached", "switched", "missing"] {
+        assert_success(&fixture.wt(["add", branch]));
+    }
+    let root = fixture.worktrees.join("example");
+    command(&root.join("detached"), "git", ["switch", "--detach"]);
+    command(&root.join("switched"), "git", ["switch", "-c", "other"]);
+    command(
+        &fixture.repo,
+        "git",
+        ["worktree", "remove", root.join("missing").to_str().unwrap()],
+    );
+    fs::create_dir(root.join("current/subdirectory")).unwrap();
+    let output = fixture
+        .wt_command(["clean", "--yes"])
+        .current_dir(root.join("current/subdirectory"))
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    for branch in ["main", "current", "detached", "switched", "missing"] {
+        assert!(text.contains(&format!("SKIP\t{branch}\t")), "{text}");
+    }
+    for branch in ["main", "current", "detached", "switched"] {
+        assert!(root.join(branch).exists());
+    }
+    assert!(text.contains("current worktree"), "{text}");
+    assert!(text.contains("base branch"), "{text}");
+}
+
+#[test]
+fn clean_leaves_other_clones_and_repositories_alone() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.wt(["add", "42"]));
+    let path = fixture.worktrees.join("example/fix-42-handle-empty-input");
+    let other = Fixture::new();
+    let output = fixture
+        .wt_command(["clean", "--yes"])
+        .current_dir(&other.repo)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("another clone"));
+    assert!(path.exists());
+    command(
+        &other.repo,
+        "git",
+        [
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/other.git",
+        ],
+    );
+    let output = fixture
+        .wt_command(["clean", "--yes"])
+        .current_dir(&other.repo)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No managed worktrees"));
+    assert!(path.exists());
+}
+
+#[test]
+fn clean_rechecks_after_teardown_and_continues_after_a_failed_candidate() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    command(
+        &fixture.repo,
+        "git",
+        [
+            "config",
+            "-f",
+            ".wtconfig",
+            "wt.teardown",
+            "if [ \"$(git branch --show-current)\" = a ]; then echo unfinished >> README.md; fi",
+        ],
+    );
+    assert_success(&fixture.wt(["trust", "--yes"]));
+    for branch in ["a", "b"] {
+        assert_success(&fixture.wt(["add", branch]));
+    }
+    let root = fixture.worktrees.join("example");
+    assert_success(&fixture.wt(["clean", "--dry-run"]));
+    assert_eq!(
+        fs::read_to_string(root.join("a/README.md")).unwrap(),
+        "example\n"
+    );
+    let output = fixture.wt(["clean", "--yes"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tracked changes"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(root.join("a/README.md"))
+            .unwrap()
+            .contains("unfinished")
+    );
+    assert!(!root.join("b").exists());
+    let listed = fixture.wt(["list", "--porcelain"]);
+    assert_success(&listed);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("\ta\t"));
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("\tb\t"));
+    command(&root.join("a"), "git", ["restore", "README.md"]);
+    assert_success(&fixture.wt(["clean", "--yes", "--skip-teardown"]));
+    assert!(!root.join("a").exists());
+}
+
+#[test]
+fn clean_keeps_a_candidate_whose_head_changes_after_preview_even_if_merged() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    command(
+        &fixture.repo,
+        "git",
+        [
+            "config",
+            "-f",
+            ".wtconfig",
+            "wt.teardown",
+            "if [ \"$(git branch --show-current)\" = a ]; then git -C ../b commit --allow-empty -m late; git -C \"$CLEAN_TEST_REPO\" merge --ff-only b; fi",
+        ],
+    );
+    assert_success(&fixture.wt(["trust", "--yes"]));
+    for branch in ["a", "b"] {
+        assert_success(&fixture.wt(["add", branch]));
+    }
+    let root = fixture.worktrees.join("example");
+    let before = git(&root.join("b"), ["rev-parse", "HEAD"]);
+    let output = fixture
+        .wt_command(["clean", "--yes"])
+        .env("CLEAN_TEST_REPO", &fixture.repo)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("HEAD changed after preview"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.join("a").exists());
+    assert!(root.join("b").exists());
+    let after = git(&root.join("b"), ["rev-parse", "HEAD"]);
+    assert_ne!(before, after);
+    assert_eq!(after, git(&fixture.repo, ["rev-parse", "main"]));
+}
+
 struct Fixture {
     _temp: TempDir,
     repo: PathBuf,

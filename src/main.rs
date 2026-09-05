@@ -54,6 +54,18 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Preview and remove safely merged worktrees in the current repository
+    Clean {
+        /// Show candidates without removing anything or running teardown
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
+        /// Remove the previewed candidates without prompting
+        #[arg(long)]
+        yes: bool,
+        /// Do not run configured teardown commands
+        #[arg(long)]
+        skip_teardown: bool,
+    },
     /// Safely remove a worktree without deleting its branch
     Remove {
         /// Issue number or branch name
@@ -138,6 +150,11 @@ fn run() -> Result<()> {
             no_bootstrap,
         } => app::add(&reference, no_bootstrap, cli.verbose),
         Command::List { porcelain, all } => app::list(porcelain, all),
+        Command::Clean {
+            dry_run,
+            yes,
+            skip_teardown,
+        } => app::clean(dry_run, yes, skip_teardown, cli.verbose),
         Command::Remove {
             reference,
             force,

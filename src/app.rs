@@ -453,6 +453,231 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) 
     Ok(())
 }
 
+pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Result<()> {
+    let repo = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
+    let repository = repository_slug(&repo)?;
+    let store = Store::open_readonly()?;
+    let mut records = store.records()?;
+    records.retain(|record| record.repository.eq_ignore_ascii_case(&repository));
+    records.sort_by(|a, b| a.branch.cmp(&b.branch));
+    if records.is_empty() {
+        println!("No managed worktrees in this repository.");
+        return Ok(());
+    }
+    let config = Config::load(&repo)?;
+    let base = match config.base {
+        Some(base) => base,
+        None => self::repository(&repo)?.default_branch.name,
+    };
+    // Resolve once for the preview; never assume the calling branch is the base.
+    let base_commit = git_output_in(
+        &repo,
+        ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )
+    .with_context(|| format!("cannot resolve base {base}; update it before running wt clean"))?;
+    let mut candidates = Vec::new();
+    for record in records {
+        match clean_candidate(&repo, &record, &base, &base_commit) {
+            Ok((head, reason)) => {
+                println!(
+                    "REMOVE\t{}\t{}\t{reason}",
+                    record.branch,
+                    record.path.display()
+                );
+                candidates.push((record, head));
+            }
+            Err(error) => println!(
+                "SKIP\t{}\t{}\t{error:#}",
+                record.branch,
+                record.path.display()
+            ),
+        }
+    }
+    if candidates.is_empty() {
+        println!("No safely merged worktrees to remove.");
+        return Ok(());
+    }
+    println!("{} candidate(s). Branches will be kept.", candidates.len());
+    if dry_run {
+        return Ok(());
+    }
+    if !yes {
+        if !io::stdin().is_terminal() {
+            bail!("cleanup needs confirmation; use --dry-run to preview or --yes to remove");
+        }
+        if !cliclack::confirm("Remove these worktrees?")
+            .initial_value(false)
+            .interact()?
+        {
+            println!("Cancelled. No worktrees removed.");
+            return Ok(());
+        }
+    }
+    let store = Store::open()?;
+    let mut removed = 0;
+    let mut failed = 0;
+    for (preview, head) in candidates {
+        let result = (|| -> Result<()> {
+            let reference = preview
+                .issue
+                .map_or_else(|| preview.branch.clone(), |n| n.to_string());
+            let _worktree_lock = store.lock_worktree(&repository, &reference)?;
+            let _lock = store.lock()?;
+            let record = match preview.issue {
+                Some(issue) => store.find_issue(&repository, issue)?,
+                None => store.find_branch(&repository, &preview.branch)?,
+            }
+            .context("worktree is no longer managed")?;
+            if serde_json::to_value(&record)? != serde_json::to_value(&preview)? {
+                bail!("worktree record changed after preview; run wt clean again");
+            }
+            let current_base = git_output_in(
+                &repo,
+                ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+            )?;
+            let (current_head, _) = clean_candidate(&repo, &record, &base, &current_base)?;
+            if current_head != head {
+                bail!("HEAD changed after preview; run wt clean again");
+            }
+            if !skip_teardown {
+                run_recorded_teardown(&store, &record, verbose)?;
+            }
+            // A teardown may itself change files or switch branches.
+            let (after_teardown, _) = clean_candidate(&repo, &record, &base, &current_base)?;
+            if after_teardown != head {
+                bail!("HEAD changed during teardown");
+            }
+            remove_recorded_worktree(&repo, &record, false)?;
+            store.delete(&record)
+        })();
+        match result {
+            Ok(()) => {
+                removed += 1;
+                println!("Removed {}", preview.branch);
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("Skipped {}: {error:#}", preview.branch);
+            }
+        }
+    }
+    println!("Removed {removed} worktree(s). Branches kept.");
+    if failed > 0 {
+        bail!("{failed} candidate(s) could not be removed");
+    }
+    Ok(())
+}
+
+fn clean_candidate(
+    repo: &Path,
+    record: &Record,
+    base: &str,
+    base_commit: &str,
+) -> Result<(String, String)> {
+    let path = fs::canonicalize(&record.path).context("worktree path is missing or unavailable")?;
+    if fs::canonicalize(std::env::current_dir()?)?.starts_with(&path) {
+        bail!("current worktree");
+    }
+    // Only linked worktrees in this checkout are eligible, not another clone
+    // of the same GitHub repository or a stale path pointing at its parent.
+    if !path.join(".git").is_file() {
+        bail!("not a linked worktree");
+    }
+    let common = |directory: &Path| -> Result<PathBuf> {
+        let value = git_output_in(directory, ["rev-parse", "--git-common-dir"])?;
+        Ok(fs::canonicalize(directory.join(value))?)
+    };
+    if common(&path)? != common(repo)? {
+        bail!("worktree belongs to another clone");
+    }
+    let git_dir = PathBuf::from(git_output_in(&path, ["rev-parse", "--absolute-git-dir"])?);
+    if git_dir.join("locked").try_exists()? {
+        bail!("worktree is locked");
+    }
+    let branch = git_output_in(&path, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .context("detached or unavailable HEAD")?;
+    if branch != record.branch {
+        bail!("checked-out branch differs from managed branch");
+    }
+    if branch
+        == base
+            .trim_start_matches("refs/heads/")
+            .trim_start_matches("refs/remotes/")
+            .trim_start_matches("origin/")
+    {
+        bail!("base branch");
+    }
+    ensure_safe_to_remove(record)?;
+    let head = git_output_in(&path, ["rev-parse", "--verify", "HEAD"])?;
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", &head, base_commit])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok((head, format!("merged into {base}"))),
+        Some(1) => {
+            let number = merged_pull_request(repo, record, base, &head)?
+                .with_context(|| format!("not merged into {base}"))?;
+            Ok((head, format!("merged PR #{number} into {base}")))
+        }
+        _ => bail!(
+            "cannot check merge status: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn merged_pull_request(
+    repo: &Path,
+    record: &Record,
+    base: &str,
+    head: &str,
+) -> Result<Option<u64>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PullRequest {
+        number: u64,
+        state: String,
+        head_ref_name: String,
+        head_ref_oid: String,
+        base_ref_name: String,
+        is_cross_repository: bool,
+    }
+    let base = base
+        .trim_start_matches("refs/heads/")
+        .trim_start_matches("refs/remotes/")
+        .trim_start_matches("origin/");
+    let output = run(Command::new("gh").current_dir(repo).args([
+        "pr",
+        "list",
+        "--repo",
+        &record.repository,
+        "--state",
+        "merged",
+        "--head",
+        &record.branch,
+        "--base",
+        base,
+        "--limit",
+        "100",
+        "--json",
+        "number,state,headRefName,headRefOid,baseRefName,isCrossRepository",
+    ]))
+    .context("cannot verify merged PRs; keeping worktree")?;
+    let prs: Vec<PullRequest> = serde_json::from_slice(&output.stdout)
+        .context("cannot parse merged PRs; keeping worktree")?;
+    Ok(prs
+        .into_iter()
+        .find(|pr| {
+            pr.state == "MERGED"
+                && !pr.is_cross_repository
+                && pr.head_ref_name == record.branch
+                && pr.head_ref_oid == head
+                && pr.base_ref_name == base
+        })
+        .map(|pr| pr.number))
+}
+
 fn remove_recorded_worktree(repo: &Path, record: &Record, force: bool) -> Result<()> {
     if force {
         return progress("Removing worktree", "Worktree removed", || {

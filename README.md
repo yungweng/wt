@@ -19,6 +19,7 @@ without deleting the branch or silently throwing away changes.
 | `wt add feat/my-change` | Create a worktree for a branch |
 | `wt list` | List worktrees created by `wt` |
 | `wt remove 42` | Safely remove by issue or branch |
+| `wt clean` | Preview and confirm removal of safely merged worktrees |
 
 ## Install
 
@@ -174,6 +175,39 @@ wt add 42 --no-bootstrap
 
 Run the configured bootstrap command from that worktree when you need its
 build tools and dependencies. Skipping bootstrap does not make them ready.
+
+## Clean up merged worktrees
+
+```sh
+wt clean --dry-run  # Preview candidates and reasons for skipped worktrees
+wt clean            # Preview, then ask before removal (default: No)
+wt clean --yes      # Remove eligible candidates without prompting
+```
+
+Cleanup covers `wt`-managed worktrees in the current repository and clone.
+It checks whether each worktree's current commit is an ancestor of `wt.base`
+(or the GitHub default branch when no base is configured). It also recognizes
+squash and rebase merges through a merged GitHub PR whose head commit exactly
+matches the worktree. New commits after a PR merge keep the worktree out of
+cleanup. PRs from forks do not qualify through this fallback.
+
+The base must resolve locally. Cleanup does not fetch or update branches;
+update your base first to include recent merges. PR checks use the
+[GitHub CLI](https://cli.github.com/manual/gh_pr_list); unavailable or
+inconclusive checks leave the worktree in place. At most 100 merged PRs per
+branch are checked. Branches with no commits ahead of the base also qualify,
+even if no PR was created. Age alone never qualifies a worktree.
+
+Cleanup skips locked worktrees, the current worktree, the base branch, detached or switched
+branches, missing paths, other clones, and worktrees that fail the same file
+safety checks as `wt remove`. The preview shows each candidate and skip reason.
+`--dry-run` never runs teardown or removes files. Non-interactive removal
+requires `--yes`; there is no `--force` option.
+
+Removal rechecks candidates after confirmation, runs trusted teardown commands,
+and keeps all branches. Use `--skip-teardown` to leave services running.
+If a candidate changes or removal fails, cleanup reports it, continues with
+the others, and exits unsuccessfully. Already removed worktrees stay removed.
 
 ## Safety and automation
 

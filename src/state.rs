@@ -117,7 +117,12 @@ impl Store {
 
     pub fn records(&self) -> Result<Vec<Record>> {
         let mut records = Vec::new();
-        for entry in fs::read_dir(self.root.join("records"))? {
+        let entries = match fs::read_dir(self.root.join("records")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
             let path = entry?.path();
             if path
                 .extension()
