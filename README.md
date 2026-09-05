@@ -78,8 +78,11 @@ missing, or unavailable. If it differs from the recorded branch, a `managed:`
 annotation shows the original reference. Removal and completion still use the
 managed issue number or original standalone branch name. `wt list --porcelain`
 keeps its stable three-column format with the recorded branch.
-Human-readable output groups worktrees by repository, aligns issue numbers,
-and puts paths on separate lines, shortening your home directory to `~`.
+Human-readable output groups worktrees by repository in compact tables.
+Columns align by terminal display width, including Unicode branch names.
+Long cells are shortened with `…` to fit the terminal. Paths use `~` for your
+home directory, or `…/directory` when the parent path does not fit. Use
+`--porcelain` for full branch names and paths without truncation.
 
 ## Start a worktree
 
@@ -189,21 +192,28 @@ wt clean --yes      # Remove eligible candidates without prompting
 Cleanup covers `wt`-managed worktrees in the current repository and clone.
 It checks whether each worktree's current commit is an ancestor of `wt.base`
 (or the GitHub default branch when no base is configured). It also recognizes
-squash and rebase merges through a merged GitHub PR whose head commit exactly
-matches the worktree. New commits after a PR merge keep the worktree out of
-cleanup. PRs from forks do not qualify through this fallback.
+squash and rebase merges through a merged GitHub PR whose final head contains
+the worktree's current commit. This includes worktrees left behind when more
+commits were added to the PR before merging. Newer or divergent local commits
+keep the worktree out of cleanup, with an explicit explanation that the PR
+is merged but does not include those commits. PRs from forks do not qualify
+through this fallback.
 
 The base must resolve locally. Cleanup does not fetch or update branches;
 update your base first to include recent merges. PR checks use the
 [GitHub CLI](https://cli.github.com/manual/gh_pr_list); unavailable or
-inconclusive checks leave the worktree in place. At most 100 merged PRs per
-branch are checked. Branches with no commits ahead of the base also qualify,
+inconclusive checks leave the worktree in place. Read-only checks use at most
+four workers and share one lookup of the 100 most recent merged PRs. When
+that page is full and no qualifying PR was found, cleanup checks up to 100
+merged PRs for the individual branch. Commit ancestry is checked locally, or
+through GitHub's comparison API when the final PR commit is unavailable locally.
+Branches with no commits ahead of the base also qualify,
 even if no PR was created. Age alone never qualifies a worktree.
 
 Cleanup skips locked worktrees, the current worktree, the base branch, detached or switched
 branches, missing paths, other clones, and worktrees that fail the same file
 safety checks as `wt remove`. The preview groups candidates under “Ready to
-remove” and “Skipped”, with reasons on separate lines. Repeated worktree paths
+remove” and “Skipped”, with one table row per worktree. Repeated worktree paths
 are omitted; use `wt list` to see them.
 `--dry-run` never runs teardown or removes files. Non-interactive removal
 requires `--yes`; there is no `--force` option.

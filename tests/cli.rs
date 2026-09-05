@@ -471,10 +471,11 @@ fn list_shows_and_remove_deletes_a_managed_worktree_but_keeps_its_branch() {
     let readable = fixture.wt(["list"]);
     assert_success(&readable);
     let readable = String::from_utf8(readable.stdout).unwrap();
-    assert!(
-        readable.starts_with("acme/example\n      #42  fix/42-handle-empty-input\n           ")
-    );
-    assert!(readable.ends_with("/example/fix-42-handle-empty-input\n\n"));
+    assert!(readable.starts_with("acme/example\nISSUE"));
+    assert!(readable.contains(" | BRANCH"));
+    assert!(readable.contains(" | PATH"));
+    assert!(readable.contains("#42"));
+    assert!(readable.contains("fix/42-handle-empty-input"));
     assert!(!readable.contains('\t'));
     let listed = fixture.wt(["list", "--porcelain"]);
     assert_success(&listed);
@@ -1286,7 +1287,7 @@ fn clean_preserves_tracked_untracked_ignored_and_changed_copied_files() {
 }
 
 #[test]
-fn clean_requires_an_exact_merged_pr_match_for_squash_merges() {
+fn clean_rejects_unrelated_prs_and_newer_local_commits_after_squash_merge() {
     let fixture = Fixture::new();
     fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
     assert_success(&fixture.wt(["add", "feat/squashed"]));
@@ -1522,6 +1523,189 @@ fn clean_keeps_a_candidate_whose_head_changes_after_preview_even_if_merged() {
     let after = git(&root.join("b"), ["rev-parse", "HEAD"]);
     assert_ne!(before, after);
     assert_eq!(after, git(&fixture.repo, ["rev-parse", "main"]));
+}
+
+#[test]
+fn clean_accepts_local_commits_included_in_a_later_merged_pr_head() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    assert_success(&fixture.wt(["add", "feat/behind"]));
+    let path = fixture.worktrees.join("example/feat-behind");
+    command(
+        &path,
+        "git",
+        ["commit", "--allow-empty", "-m", "local work"],
+    );
+    let local = git(&path, ["rev-parse", "HEAD"]);
+    command(
+        &path,
+        "git",
+        ["commit", "--allow-empty", "-m", "included before merge"],
+    );
+    let merged = git(&path, ["rev-parse", "HEAD"]);
+    command(&path, "git", ["switch", "--detach", &local]);
+    command(
+        &fixture.repo,
+        "git",
+        ["branch", "-f", "feat/behind", &local],
+    );
+    command(&path, "git", ["switch", "feat/behind"]);
+    fs::write(
+        fixture.bin.join("gh"),
+        "#!/bin/sh\ncat \"${0%/*}/prs.json\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.bin.join("prs.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "number": 123, "state": "MERGED", "headRefName": "feat/behind",
+            "headRefOid": merged, "baseRefName": "main", "isCrossRepository": false
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = fixture.wt(["clean", "--dry-run"]);
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Ready to remove (1)"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_success(&fixture.wt(["clean", "--yes"]));
+    assert!(!path.exists());
+    assert_eq!(git(&fixture.repo, ["rev-parse", "feat/behind"]), local);
+}
+
+#[test]
+fn clean_verifies_missing_pr_commits_on_github_without_fetching() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    assert_success(&fixture.wt(["add", "feat/remote"]));
+    let path = fixture.worktrees.join("example/feat-remote");
+    command(&path, "git", ["commit", "--allow-empty", "-m", "local"]);
+    fs::write(fixture.bin.join("gh"), "#!/bin/sh\nif [ \"$1\" = api ]; then cat \"${0%/*}/comparison\"; else cat \"${0%/*}/prs.json\"; fi\n").unwrap();
+    fs::write(
+        fixture.bin.join("prs.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "number": 123, "state": "MERGED", "headRefName": "feat/remote",
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "baseRefName": "main", "isCrossRepository": false
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    for status in ["behind", "diverged", "unexpected"] {
+        fs::write(fixture.bin.join("comparison"), status).unwrap();
+        let output = fixture.wt(["clean", "--yes"]);
+        assert_success(&output);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("Skipped (1)"), "{text}");
+        assert!(text.contains("merged"), "{text}");
+        assert!(path.exists());
+    }
+    for status in ["ahead", "identical"] {
+        fs::write(fixture.bin.join("comparison"), status).unwrap();
+        let output = fixture.wt(["clean", "--dry-run"]);
+        assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Ready to remove (1)"));
+    }
+    assert_success(&fixture.wt(["clean", "--yes"]));
+    assert!(!path.exists());
+    assert!(!fixture.repo.join(".git/FETCH_HEAD").exists());
+}
+
+#[test]
+fn clean_shares_one_recent_pr_lookup_across_worktrees() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    for branch in ["one", "two"] {
+        assert_success(&fixture.wt(["add", branch]));
+        command(
+            &fixture.worktrees.join("example").join(branch),
+            "git",
+            ["commit", "--allow-empty", "-m", branch],
+        );
+    }
+    fs::write(
+        fixture.bin.join("gh"),
+        "#!/bin/sh\necho lookup >> \"${0%/*}/calls\"\nprintf '[]'\n",
+    )
+    .unwrap();
+    let output = fixture.wt(["clean", "--dry-run"]);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Skipped (2)"));
+    assert_eq!(
+        fs::read_to_string(fixture.bin.join("calls")).unwrap(),
+        "lookup\n"
+    );
+}
+
+#[test]
+fn clean_checks_older_branch_prs_when_the_recent_page_is_full() {
+    let fixture = Fixture::new();
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    assert_success(&fixture.wt(["add", "old"]));
+    let path = fixture.worktrees.join("example/old");
+    command(&path, "git", ["commit", "--allow-empty", "-m", "old work"]);
+    let pr = serde_json::json!({"number": 123, "state": "MERGED", "headRefName": "old",
+        "headRefOid": git(&path, ["rev-parse", "HEAD"]), "baseRefName": "main", "isCrossRepository": false});
+    let recent = (0..100)
+        .map(|number| {
+            let mut pr = pr.clone();
+            pr["number"] = serde_json::json!(number);
+            pr["headRefName"] = serde_json::json!("unrelated");
+            pr
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        fixture.bin.join("recent.json"),
+        serde_json::to_vec(&recent).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.bin.join("old.json"),
+        serde_json::to_vec(&vec![pr]).unwrap(),
+    )
+    .unwrap();
+    fs::write(fixture.bin.join("gh"), "#!/bin/sh\nfor arg do\nif [ \"$arg\" = --head ]; then cat \"${0%/*}/old.json\"; exit; fi\ndone\ncat \"${0%/*}/recent.json\"\n").unwrap();
+    let output = fixture.wt(["clean", "--dry-run"]);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Ready to remove (1)"));
+}
+
+#[test]
+fn tables_fit_narrow_terminals_and_align_unicode_branches() {
+    let fixture = Fixture::new();
+    let branch = "feat/füße-界界界-long-branch-name-for-a-narrow-terminal";
+    assert_success(&fixture.wt(["add", branch]));
+    for args in [vec!["list"], vec!["clean", "--dry-run"]] {
+        let output = fixture
+            .wt_command(args)
+            .env("COLUMNS", "80")
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            assert!(console::measure_text_width(line) <= 80, "{line}");
+        }
+        let lines = text
+            .lines()
+            .filter(|line| line.contains(" | "))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{text}");
+        let widths = |line: &str| {
+            line.split(" | ")
+                .take(2)
+                .map(console::measure_text_width)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(widths(lines[0]), widths(lines[1]));
+        assert!(text.contains('…'));
+    }
+    let full = fixture.wt(["list", "--porcelain"]);
+    assert_success(&full);
+    assert!(String::from_utf8_lossy(&full.stdout).contains(branch));
 }
 
 struct Fixture {

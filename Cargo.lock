@@ -584,6 +584,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "cliclack",
+ "console",
  "fs4",
  "serde",
  "serde_json",

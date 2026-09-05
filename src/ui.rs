@@ -7,13 +7,83 @@ use std::{
 
 use anyhow::Result;
 
-pub fn worktree(issue: Option<u64>, branch: &str, detail: &str) {
-    let reference = issue.map_or_else(|| "-".to_owned(), |issue| format!("#{issue}"));
-    println!("  {:>7}  {}", reference, stdout_style(branch, 1));
-    for line in detail.lines() {
-        println!("           {}", stdout_style(line, 2));
+pub fn worktree_table(rows: &[(Option<u64>, String, String)], detail_heading: &str) {
+    let issue = |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |n| format!("#{n}"));
+    let issue_width = rows
+        .iter()
+        .map(|row| issue(row.0).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let terminal_width = console::Term::stdout()
+        .size_checked()
+        .map(|(_, width)| usize::from(width))
+        .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
+        .unwrap_or(140);
+    let available = terminal_width.saturating_sub(issue_width + 6);
+    let branch_width = rows
+        .iter()
+        .map(|row| console::measure_text_width(&row.1))
+        .max()
+        .unwrap_or(6)
+        .max(6)
+        .min(available / 2);
+    let detail_width = rows
+        .iter()
+        .map(|row| console::measure_text_width(&row.2))
+        .max()
+        .unwrap_or(0)
+        .max(detail_heading.len())
+        .min(available.saturating_sub(branch_width));
+    let cell = |value: &str, width: usize| {
+        let value = value.replace(['\n', '\r', '\t'], " ");
+        let text = console::truncate_str(&value, width, "…");
+        format!(
+            "{}{}",
+            text,
+            " ".repeat(width.saturating_sub(console::measure_text_width(&text)))
+        )
+    };
+    println!(
+        "{}",
+        stdout_style(
+            &format!(
+                "{} | {} | {}",
+                cell("ISSUE", issue_width),
+                cell("BRANCH", branch_width),
+                detail_heading
+            ),
+            1
+        )
+    );
+    println!(
+        "{}",
+        stdout_style(
+            &format!(
+                "{}-+-{}-+-{}",
+                "-".repeat(issue_width),
+                "-".repeat(branch_width),
+                "-".repeat(detail_width)
+            ),
+            2
+        )
+    );
+    for (number, branch, detail) in rows {
+        let detail =
+            if detail_heading == "PATH" && console::measure_text_width(detail) > detail_width {
+                detail
+                    .rsplit_once('/')
+                    .map_or_else(|| detail.clone(), |(_, name)| format!("…/{name}"))
+            } else {
+                detail.clone()
+            };
+        println!(
+            "{} | {} | {}",
+            cell(&issue(*number), issue_width),
+            cell(branch, branch_width),
+            console::truncate_str(&detail.replace(['\n', '\r', '\t'], " "), detail_width, "…")
+        );
     }
-    println!();
 }
 
 pub fn display_path(path: &std::path::Path) -> String {

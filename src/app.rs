@@ -379,30 +379,34 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
     if !porcelain && records.is_empty() {
         println!("No managed worktrees.");
     }
-    let mut group = String::new();
-    for record in records {
-        if porcelain {
+    if porcelain {
+        for record in records {
             println!(
                 "{}\t{}\t{}",
                 record
                     .issue
-                    .map_or_else(|| "-".to_owned(), |issue| issue.to_string()),
+                    .map_or_else(|| "-".to_owned(), |n| n.to_string()),
                 record.branch,
                 record.path.display()
             );
-        } else {
-            if group != record.repository {
-                if !group.is_empty() {
-                    println!();
-                }
-                println!("{}", ui::stdout_style(&record.repository, 1));
-                group = record.repository.clone();
-            }
-            ui::worktree(
+        }
+    } else {
+        let mut groups = std::collections::BTreeMap::new();
+        for record in records {
+            let row = (
                 record.issue,
-                &displayed_branch(&record),
-                &ui::display_path(&record.path),
+                displayed_branch(&record),
+                ui::display_path(&record.path),
             );
+            groups
+                .entry(record.repository)
+                .or_insert_with(Vec::new)
+                .push(row);
+        }
+        for (repository, rows) in groups {
+            println!("{}", ui::stdout_style(&repository, 1));
+            ui::worktree_table(&rows, "PATH");
+            println!();
         }
     }
     Ok(())
@@ -464,6 +468,22 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) 
     Ok(())
 }
 
+#[derive(Default)]
+struct MergeChecks {
+    pulls: std::sync::OnceLock<std::result::Result<Vec<PullRequest>, String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequest {
+    number: u64,
+    state: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    base_ref_name: String,
+    is_cross_repository: bool,
+}
+
 pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Result<()> {
     let repo = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let repository = repository_slug(&repo)?;
@@ -486,10 +506,35 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
         ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
     )
     .with_context(|| format!("cannot resolve base {base}; update it before running wt clean"))?;
+    let checks = MergeChecks::default();
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
-    for record in records {
-        match clean_candidate(&repo, &record, &base, &base_commit) {
+    // Read-only inspection is bounded to four workers; removal stays serial.
+    let inspections = std::thread::scope(|scope| -> Result<Vec<_>> {
+        let workers = records
+            .chunks(records.len().div_ceil(4))
+            .map(|chunk| {
+                let (repo, base, base_commit, checks) = (&repo, &base, &base_commit, &checks);
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|record| clean_candidate(repo, record, base, base_commit, checks))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for worker in workers {
+            results.extend(
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("worktree inspection panicked"))?,
+            );
+        }
+        Ok(results)
+    })?;
+    for (record, inspection) in records.into_iter().zip(inspections) {
+        match inspection {
             Ok((head, reason)) => candidates.push((record, head, reason)),
             Err(error) => skipped.push((record, format!("{error:#}"))),
         }
@@ -500,18 +545,34 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
             "\n{}",
             ui::stdout_style(&format!("Ready to remove ({})", candidates.len()), 32)
         );
-        for (record, _, reason) in &candidates {
-            ui::worktree(record.issue, &record.branch, reason);
-        }
+        let rows = candidates
+            .iter()
+            .map(|(record, _, reason)| (record.issue, record.branch.clone(), reason.clone()))
+            .collect::<Vec<_>>();
+        ui::worktree_table(&rows, "REASON");
     }
     if !skipped.is_empty() {
         println!(
             "\n{}",
             ui::stdout_style(&format!("Skipped ({})", skipped.len()), 33)
         );
-        for (record, reason) in &skipped {
-            ui::worktree(record.issue, &record.branch, reason);
-        }
+        let rows = skipped
+            .iter()
+            .map(|(record, reason)| {
+                (
+                    record.issue,
+                    record.branch.clone(),
+                    reason
+                        .replace("worktree contains an unmanaged file: ", "Unmanaged: ")
+                        .replace("worktree contains tracked changes: ", "Modified: ")
+                        .replace(
+                            "no merged PR found for this branch into ",
+                            "No merged PR into ",
+                        ),
+                )
+            })
+            .collect::<Vec<_>>();
+        ui::worktree_table(&rows, "REASON");
     }
     println!();
     if candidates.is_empty() {
@@ -556,7 +617,7 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
                 &repo,
                 ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
             )?;
-            let (current_head, _) = clean_candidate(&repo, &record, &base, &current_base)?;
+            let (current_head, _) = clean_candidate(&repo, &record, &base, &current_base, &checks)?;
             if current_head != head {
                 bail!("HEAD changed after preview; run wt clean again");
             }
@@ -564,7 +625,8 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
                 run_recorded_teardown(&store, &record, verbose)?;
             }
             // A teardown may itself change files or switch branches.
-            let (after_teardown, _) = clean_candidate(&repo, &record, &base, &current_base)?;
+            let (after_teardown, _) =
+                clean_candidate(&repo, &record, &base, &current_base, &checks)?;
             if after_teardown != head {
                 bail!("HEAD changed during teardown");
             }
@@ -594,6 +656,7 @@ fn clean_candidate(
     record: &Record,
     base: &str,
     base_commit: &str,
+    checks: &MergeChecks,
 ) -> Result<(String, String)> {
     let path = fs::canonicalize(&record.path).context("worktree path is missing or unavailable")?;
     if fs::canonicalize(std::env::current_dir()?)?.starts_with(&path) {
@@ -637,8 +700,8 @@ fn clean_candidate(
     match output.status.code() {
         Some(0) => Ok((head, format!("merged into {base}"))),
         Some(1) => {
-            let number = merged_pull_request(repo, record, base, &head)?
-                .with_context(|| format!("not merged into {base}"))?;
+            let number = merged_pull_request(repo, record, base, &head, checks)?
+                .with_context(|| format!("no merged PR found for this branch into {base}"))?;
             Ok((head, format!("merged PR #{number} into {base}")))
         }
         _ => bail!(
@@ -653,50 +716,118 @@ fn merged_pull_request(
     record: &Record,
     base: &str,
     head: &str,
+    checks: &MergeChecks,
 ) -> Result<Option<u64>> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct PullRequest {
-        number: u64,
-        state: String,
-        head_ref_name: String,
-        head_ref_oid: String,
-        base_ref_name: String,
-        is_cross_repository: bool,
-    }
     let base = base
         .trim_start_matches("refs/heads/")
         .trim_start_matches("refs/remotes/")
         .trim_start_matches("origin/");
-    let output = run(Command::new("gh").current_dir(repo).args([
+    let prs = checks
+        .pulls
+        .get_or_init(|| {
+            query_merged_pull_requests(repo, &record.repository, base, None)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.clone()))?;
+    let mut matched = None;
+    let mut check = |prs: &[PullRequest]| -> Result<Option<u64>> {
+        for pr in prs.iter().filter(|pr| {
+            pr.state == "MERGED"
+                && !pr.is_cross_repository
+                && pr.head_ref_name == record.branch
+                && pr.base_ref_name == base
+        }) {
+            matched = Some(pr.number);
+            if included_in_merged_head(repo, &record.repository, head, &pr.head_ref_oid)? {
+                return Ok(Some(pr.number));
+            }
+        }
+        Ok(None)
+    };
+    if let Some(number) = check(prs)? {
+        return Ok(Some(number));
+    }
+    // A full recent page is not proof that an older branch has no merged PR.
+    if prs.len() == 100 {
+        let older =
+            query_merged_pull_requests(repo, &record.repository, base, Some(&record.branch))?;
+        if let Some(number) = check(&older)? {
+            return Ok(Some(number));
+        }
+    }
+    if let Some(number) = matched {
+        bail!("PR #{number} is merged; local commits are not included in its merged head");
+    }
+    Ok(None)
+}
+
+fn query_merged_pull_requests(
+    repo: &Path,
+    repository: &str,
+    base: &str,
+    branch: Option<&str>,
+) -> Result<Vec<PullRequest>> {
+    let mut command = Command::new("gh");
+    command.current_dir(repo).args([
         "pr",
         "list",
         "--repo",
-        &record.repository,
+        repository,
         "--state",
         "merged",
-        "--head",
-        &record.branch,
         "--base",
         base,
         "--limit",
         "100",
         "--json",
         "number,state,headRefName,headRefOid,baseRefName,isCrossRepository",
+    ]);
+    if let Some(branch) = branch {
+        command.args(["--head", branch]);
+    }
+    let output = run(&mut command).context("cannot verify merged PRs; keeping worktree")?;
+    serde_json::from_slice(&output.stdout).context("cannot parse merged PRs; keeping worktree")
+}
+
+fn included_in_merged_head(
+    repo: &Path,
+    repository: &str,
+    head: &str,
+    merged: &str,
+) -> Result<bool> {
+    if head == merged {
+        return Ok(true);
+    }
+    // Resolve locally when possible; comparison on GitHub avoids fetching or
+    // changing refs when the PR's final commit only exists on the server.
+    let known = Command::new("git")
+        .current_dir(repo)
+        .args(["cat-file", "-e", &format!("{merged}^{{commit}}")])
+        .output()?;
+    if known.status.success() {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["merge-base", "--is-ancestor", head, merged])
+            .output()?;
+        return match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!("cannot compare local commits with merged PR"),
+        };
+    }
+    let output = run(Command::new("gh").current_dir(repo).args([
+        "api",
+        &format!("repos/{repository}/compare/{head}...{merged}"),
+        "--jq",
+        ".status",
     ]))
-    .context("cannot verify merged PRs; keeping worktree")?;
-    let prs: Vec<PullRequest> = serde_json::from_slice(&output.stdout)
-        .context("cannot parse merged PRs; keeping worktree")?;
-    Ok(prs
-        .into_iter()
-        .find(|pr| {
-            pr.state == "MERGED"
-                && !pr.is_cross_repository
-                && pr.head_ref_name == record.branch
-                && pr.head_ref_oid == head
-                && pr.base_ref_name == base
-        })
-        .map(|pr| pr.number))
+    .context("PR is merged, but cannot verify whether it includes local commits")?;
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "ahead" | "identical" => Ok(true),
+        "behind" | "diverged" => Ok(false),
+        _ => bail!("PR is merged, but GitHub returned an unknown commit comparison"),
+    }
 }
 
 fn remove_recorded_worktree(repo: &Path, record: &Record, force: bool) -> Result<()> {
