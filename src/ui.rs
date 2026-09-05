@@ -53,6 +53,9 @@ pub fn worktree_table(
             " ".repeat(width.saturating_sub(console::measure_text_width(&text)))
         )
     };
+    if links && rows.iter().any(|row| row.0.is_some()) {
+        println!("Issue links: Cmd/Ctrl-click a number.");
+    }
     println!(
         "{}",
         stdout_style(
@@ -81,9 +84,12 @@ pub fn worktree_table(
         let label = issue(*number);
         let padding = " ".repeat(issue_width.saturating_sub(label.len()));
         let issue_cell = match number {
-            Some(number) if links => format!(
-                "\x1b]8;;https://github.com/{repository}/issues/{number}\x1b\\{label}\x1b]8;;\x1b\\{padding}"
-            ),
+            Some(number) if links => {
+                let label = stdout_style(&stdout_style(&label, 34), 4);
+                format!(
+                    "\x1b]8;;https://github.com/{repository}/issues/{number}\x1b\\{label}\x1b]8;;\x1b\\{padding}"
+                )
+            }
             _ => format!("{label}{padding}"),
         };
         let detail =
