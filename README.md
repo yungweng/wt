@@ -83,6 +83,9 @@ Columns align by terminal display width, including Unicode branch names.
 Long cells are shortened with `…` to fit the terminal. Paths use `~` for your
 home directory, or `…/directory` when the parent path does not fit. Use
 `--porcelain` for full branch names and paths without truncation.
+In terminals supporting OSC 8 hyperlinks, issue numbers in `wt list` and
+`wt clean` link to their GitHub issues. Links are built locally, without
+network requests. Redirected output and `--porcelain` remain plain text.
 
 ## Start a worktree
 

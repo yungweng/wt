@@ -405,7 +405,7 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
         }
         for (repository, rows) in groups {
             println!("{}", ui::stdout_style(&repository, 1));
-            ui::worktree_table(&rows, "PATH");
+            ui::worktree_table(&repository, &rows, "PATH");
             println!();
         }
     }
@@ -549,7 +549,7 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
             .iter()
             .map(|(record, _, reason)| (record.issue, record.branch.clone(), reason.clone()))
             .collect::<Vec<_>>();
-        ui::worktree_table(&rows, "REASON");
+        ui::worktree_table(&repository, &rows, "REASON");
     }
     if !skipped.is_empty() {
         println!(
@@ -572,7 +572,7 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
                 )
             })
             .collect::<Vec<_>>();
-        ui::worktree_table(&rows, "REASON");
+        ui::worktree_table(&repository, &rows, "REASON");
     }
     println!();
     if candidates.is_empty() {

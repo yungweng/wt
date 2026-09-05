@@ -7,7 +7,16 @@ use std::{
 
 use anyhow::Result;
 
-pub fn worktree_table(rows: &[(Option<u64>, String, String)], detail_heading: &str) {
+pub fn worktree_table(
+    repository: &str,
+    rows: &[(Option<u64>, String, String)],
+    detail_heading: &str,
+) {
+    let links = std::io::stdout().is_terminal()
+        && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
+        && repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'));
     let issue = |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |n| format!("#{n}"));
     let issue_width = rows
         .iter()
@@ -69,6 +78,14 @@ pub fn worktree_table(rows: &[(Option<u64>, String, String)], detail_heading: &s
         )
     );
     for (number, branch, detail) in rows {
+        let label = issue(*number);
+        let padding = " ".repeat(issue_width.saturating_sub(label.len()));
+        let issue_cell = match number {
+            Some(number) if links => format!(
+                "\x1b]8;;https://github.com/{repository}/issues/{number}\x1b\\{label}\x1b]8;;\x1b\\{padding}"
+            ),
+            _ => format!("{label}{padding}"),
+        };
         let detail =
             if detail_heading == "PATH" && console::measure_text_width(detail) > detail_width {
                 detail
@@ -79,7 +96,7 @@ pub fn worktree_table(rows: &[(Option<u64>, String, String)], detail_heading: &s
             };
         println!(
             "{} | {} | {}",
-            cell(&issue(*number), issue_width),
+            issue_cell,
             cell(branch, branch_width),
             console::truncate_str(&detail.replace(['\n', '\r', '\t'], " "), detail_width, "…")
         );
