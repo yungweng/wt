@@ -376,23 +376,34 @@ pub fn list(porcelain: bool, all: bool) -> Result<()> {
             record.branch.clone(),
         )
     });
-    if !porcelain && !records.is_empty() {
-        println!("ISSUE\tBRANCH\tPATH");
+    if !porcelain && records.is_empty() {
+        println!("No managed worktrees.");
     }
+    let mut group = String::new();
     for record in records {
-        let branch = if porcelain {
-            record.branch.clone()
+        if porcelain {
+            println!(
+                "{}\t{}\t{}",
+                record
+                    .issue
+                    .map_or_else(|| "-".to_owned(), |issue| issue.to_string()),
+                record.branch,
+                record.path.display()
+            );
         } else {
-            displayed_branch(&record)
-        };
-        println!(
-            "{}\t{}\t{}",
-            record
-                .issue
-                .map_or_else(|| "-".to_owned(), |issue| issue.to_string()),
-            branch,
-            record.path.display()
-        );
+            if group != record.repository {
+                if !group.is_empty() {
+                    println!();
+                }
+                println!("{}", ui::stdout_style(&record.repository, 1));
+                group = record.repository.clone();
+            }
+            ui::worktree(
+                record.issue,
+                &displayed_branch(&record),
+                &ui::display_path(&record.path),
+            );
+        }
     }
     Ok(())
 }
@@ -476,23 +487,33 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
     )
     .with_context(|| format!("cannot resolve base {base}; update it before running wt clean"))?;
     let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
     for record in records {
         match clean_candidate(&repo, &record, &base, &base_commit) {
-            Ok((head, reason)) => {
-                println!(
-                    "REMOVE\t{}\t{}\t{reason}",
-                    record.branch,
-                    record.path.display()
-                );
-                candidates.push((record, head));
-            }
-            Err(error) => println!(
-                "SKIP\t{}\t{}\t{error:#}",
-                record.branch,
-                record.path.display()
-            ),
+            Ok((head, reason)) => candidates.push((record, head, reason)),
+            Err(error) => skipped.push((record, format!("{error:#}"))),
         }
     }
+    println!("{}", ui::stdout_style(&repository, 1));
+    if !candidates.is_empty() {
+        println!(
+            "\n{}",
+            ui::stdout_style(&format!("Ready to remove ({})", candidates.len()), 32)
+        );
+        for (record, _, reason) in &candidates {
+            ui::worktree(record.issue, &record.branch, reason);
+        }
+    }
+    if !skipped.is_empty() {
+        println!(
+            "\n{}",
+            ui::stdout_style(&format!("Skipped ({})", skipped.len()), 33)
+        );
+        for (record, reason) in &skipped {
+            ui::worktree(record.issue, &record.branch, reason);
+        }
+    }
+    println!();
     if candidates.is_empty() {
         println!("No safely merged worktrees to remove.");
         return Ok(());
@@ -516,7 +537,7 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
     let store = Store::open()?;
     let mut removed = 0;
     let mut failed = 0;
-    for (preview, head) in candidates {
+    for (preview, head, _) in candidates {
         let result = (|| -> Result<()> {
             let reference = preview
                 .issue

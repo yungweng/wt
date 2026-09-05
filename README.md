@@ -78,6 +78,8 @@ missing, or unavailable. If it differs from the recorded branch, a `managed:`
 annotation shows the original reference. Removal and completion still use the
 managed issue number or original standalone branch name. `wt list --porcelain`
 keeps its stable three-column format with the recorded branch.
+Human-readable output groups worktrees by repository, aligns issue numbers,
+and puts paths on separate lines, shortening your home directory to `~`.
 
 ## Start a worktree
 
@@ -200,7 +202,9 @@ even if no PR was created. Age alone never qualifies a worktree.
 
 Cleanup skips locked worktrees, the current worktree, the base branch, detached or switched
 branches, missing paths, other clones, and worktrees that fail the same file
-safety checks as `wt remove`. The preview shows each candidate and skip reason.
+safety checks as `wt remove`. The preview groups candidates under “Ready to
+remove” and “Skipped”, with reasons on separate lines. Repeated worktree paths
+are omitted; use `wt list` to see them.
 `--dry-run` never runs teardown or removes files. Non-interactive removal
 requires `--yes`; there is no `--force` option.
 

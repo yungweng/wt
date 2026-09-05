@@ -7,8 +7,37 @@ use std::{
 
 use anyhow::Result;
 
+pub fn worktree(issue: Option<u64>, branch: &str, detail: &str) {
+    let reference = issue.map_or_else(|| "-".to_owned(), |issue| format!("#{issue}"));
+    println!("  {:>7}  {}", reference, stdout_style(branch, 1));
+    for line in detail.lines() {
+        println!("           {}", stdout_style(line, 2));
+    }
+    println!();
+}
+
+pub fn display_path(path: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(relative) = path.strip_prefix(home) {
+            return std::path::Path::new("~")
+                .join(relative)
+                .display()
+                .to_string();
+        }
+    }
+    path.display().to_string()
+}
+
 pub fn terminal() -> bool {
     std::io::stderr().is_terminal()
+}
+
+pub fn stdout_style(text: &str, code: u8) -> String {
+    if std::io::stdout().is_terminal() {
+        style(text, code)
+    } else {
+        text.to_owned()
+    }
 }
 
 fn interactive() -> bool {

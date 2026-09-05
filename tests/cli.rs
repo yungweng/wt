@@ -468,6 +468,14 @@ fn list_shows_and_remove_deletes_a_managed_worktree_but_keeps_its_branch() {
     let path = fixture.worktrees.join("example/fix-42-handle-empty-input");
     fixture.fail_gh_calls();
 
+    let readable = fixture.wt(["list"]);
+    assert_success(&readable);
+    let readable = String::from_utf8(readable.stdout).unwrap();
+    assert!(
+        readable.starts_with("acme/example\n      #42  fix/42-handle-empty-input\n           ")
+    );
+    assert!(readable.ends_with("/example/fix-42-handle-empty-input\n\n"));
+    assert!(!readable.contains('\t'));
     let listed = fixture.wt(["list", "--porcelain"]);
     assert_success(&listed);
     assert_eq!(
@@ -1177,7 +1185,10 @@ fn clean_previews_then_removes_merged_worktrees_and_keeps_branches() {
     let preview = fixture.wt(["clean", "--dry-run"]);
     assert_success(&preview);
     let text = String::from_utf8_lossy(&preview.stdout);
-    assert!(text.contains("REMOVE\tfeat/merged\t"), "{text}");
+    assert!(
+        text.contains("Ready to remove (1)") && text.contains("feat/merged"),
+        "{text}"
+    );
     assert!(text.contains("merged into main"), "{text}");
     assert!(path.join("feature").exists());
     let unconfirmed = fixture
@@ -1213,7 +1224,10 @@ fn clean_skips_locked_worktrees_before_teardown_or_generated_file_cleanup() {
     let preview = fixture.wt(["clean", "--dry-run"]);
     assert_success(&preview);
     let text = String::from_utf8_lossy(&preview.stdout);
-    assert!(text.contains("SKIP\tfeat/locked\t"), "{text}");
+    assert!(
+        text.contains("Skipped (1)") && text.contains("feat/locked"),
+        "{text}"
+    );
     assert!(text.contains("locked"), "{text}");
     assert_success(&fixture.wt(["clean", "--yes"]));
     assert!(path.join("generated/keep").exists());
@@ -1258,7 +1272,10 @@ fn clean_preserves_tracked_untracked_ignored_and_changed_copied_files() {
     assert_success(&output);
     let text = String::from_utf8_lossy(&output.stdout);
     for branch in ["tracked", "untracked", "ignored", "copied"] {
-        assert!(text.contains(&format!("SKIP\t{branch}\t")), "{text}");
+        assert!(
+            text.split("Skipped (").nth(1).unwrap().contains(branch),
+            "{text}"
+        );
         assert!(fixture.worktrees.join("example").join(branch).exists());
     }
     assert!(!fixture.worktrees.join("example/safe").exists());
@@ -1316,7 +1333,7 @@ fn clean_requires_an_exact_merged_pr_match_for_squash_merges() {
         let output = fixture.wt(["clean", "--yes"]);
         assert_success(&output);
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("SKIP\tfeat/squashed\t"),
+            String::from_utf8_lossy(&output.stdout).contains("Skipped (1)"),
             "{field}"
         );
         assert!(path.exists(), "{field}");
@@ -1375,7 +1392,10 @@ fn clean_skips_current_base_detached_switched_and_missing_worktrees() {
     assert_success(&output);
     let text = String::from_utf8_lossy(&output.stdout);
     for branch in ["main", "current", "detached", "switched", "missing"] {
-        assert!(text.contains(&format!("SKIP\t{branch}\t")), "{text}");
+        assert!(
+            text.split("Skipped (").nth(1).unwrap().contains(branch),
+            "{text}"
+        );
     }
     for branch in ["main", "current", "detached", "switched"] {
         assert!(root.join(branch).exists());
