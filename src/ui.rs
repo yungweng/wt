@@ -53,9 +53,6 @@ pub fn worktree_table(
             " ".repeat(width.saturating_sub(console::measure_text_width(&text)))
         )
     };
-    if links && rows.iter().any(|row| row.0.is_some()) {
-        println!("Issue links: Cmd/Ctrl-click a number.");
-    }
     println!(
         "{}",
         stdout_style(
