@@ -115,7 +115,10 @@ creates a standalone worktree, so `wt add test` needs no issue.
 Progress and errors go to stderr. Common issue labels produce `fix/`, `feat/`,
 or `docs/` branches; other issues use `work/`. A branch name skips issue lookup
 and starts at `wt.base`, or at the current branch when no base is configured.
-If the branch already exists locally or on `origin`, `wt` checks it out.
+`wt` fetches the base from `origin` first, so new worktrees always start at
+the latest remote commit; a local base branch is used only when the base is
+missing on `origin`. If the branch already exists locally or on `origin`,
+`wt` checks it out.
 
 ## Configure a repository
 

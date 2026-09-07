@@ -261,12 +261,19 @@ fn create_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result
     }
 }
 
+/// Prefers the freshly fetched `origin/<base>` so new worktrees never start
+/// from a stale local base branch. Falls back to the local branch only when
+/// the base does not exist on `origin`.
 fn starting_point(repo: &Path, base: &str) -> Result<String> {
-    if local_branch_exists(repo, base)? {
-        return Ok(base.to_owned());
+    match run_git(repo, ["fetch", "origin", base]) {
+        Ok(()) => Ok(format!("origin/{base}")),
+        Err(error) => {
+            if local_branch_exists(repo, base)? {
+                return Ok(base.to_owned());
+            }
+            Err(error.context(format!("base branch {base} is not on origin or local")))
+        }
     }
-    run_git(repo, ["fetch", "origin", base])?;
-    Ok(format!("origin/{base}"))
 }
 
 fn remote_branch_exists(repo: &Path, branch: &str) -> Result<bool> {

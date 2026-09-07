@@ -291,21 +291,50 @@ fn add_tracks_an_existing_remote_branch() {
 }
 
 #[test]
-fn add_starts_from_the_local_base_branch_when_it_is_ahead() {
+fn add_starts_from_origin_even_when_the_local_base_branch_is_stale() {
     let fixture = Fixture::new();
-    fixture.write("local-setup.txt", "ready\n");
-    command(&fixture.repo, "git", ["add", "local-setup.txt"]);
-    command(&fixture.repo, "git", ["commit", "-m", "local setup"]);
-    let fetch_head = fixture.repo.join(".git/FETCH_HEAD");
-    assert!(!fetch_head.exists());
+    // origin/main moves ahead of the local main branch.
+    let other = fixture.clone_repo("other");
+    fs::write(other.join("upstream.txt"), "from origin\n").unwrap();
+    command(&other, "git", ["add", "upstream.txt"]);
+    command(&other, "git", ["commit", "-m", "upstream work"]);
+    command(&other, "git", ["push", "origin", "main"]);
+    // The local main branch has a commit that is not on origin.
+    fixture.write("local-only.txt", "local\n");
+    command(&fixture.repo, "git", ["add", "local-only.txt"]);
+    command(&fixture.repo, "git", ["commit", "-m", "local only"]);
 
     let output = fixture.wt(["add", "42"]);
 
     assert_success(&output);
-    assert!(!fetch_head.exists());
     let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
     assert_eq!(
-        fs::read_to_string(path.join("local-setup.txt")).unwrap(),
+        fs::read_to_string(path.join("upstream.txt")).unwrap(),
+        "from origin\n"
+    );
+    assert!(!path.join("local-only.txt").exists());
+    assert_eq!(
+        git(&path, ["rev-parse", "HEAD"]),
+        git(&fixture.repo, ["rev-parse", "origin/main"])
+    );
+}
+
+#[test]
+fn add_falls_back_to_a_local_base_branch_missing_on_origin() {
+    let fixture = Fixture::new();
+    command(&fixture.repo, "git", ["checkout", "-b", "local-base"]);
+    fixture.write("local-base.txt", "ready\n");
+    command(&fixture.repo, "git", ["add", "local-base.txt"]);
+    command(&fixture.repo, "git", ["commit", "-m", "local base"]);
+    command(&fixture.repo, "git", ["checkout", "main"]);
+    fixture.write(".wtconfig", "[wt]\n\tbase = local-base\n");
+
+    let output = fixture.wt(["add", "42"]);
+
+    assert_success(&output);
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(
+        fs::read_to_string(path.join("local-base.txt")).unwrap(),
         "ready\n"
     );
 }
@@ -895,6 +924,7 @@ fn disposable_directory_cannot_contain_tracked_files() {
         "git",
         ["commit", "-m", "tracked generated file"],
     );
+    command(&fixture.repo, "git", ["push", "origin", "main"]);
     fixture.write(".wtconfig", "[wt]\n\tdisposable = generated\n");
 
     let output = fixture.wt(["add", "42"]);
@@ -952,6 +982,7 @@ fn remove_allows_ignored_empty_directory_trees() {
     fixture.write(".gitignore", "uploads/\n");
     command(&fixture.repo, "git", ["add", ".gitignore"]);
     command(&fixture.repo, "git", ["commit", "-m", "ignore uploads"]);
+    command(&fixture.repo, "git", ["push", "origin", "main"]);
     let added = fixture.wt(["add", "42"]);
     assert_success(&added);
     let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
@@ -979,6 +1010,7 @@ fn remove_protects_contents_of_ignored_directories() {
     fixture.write(".gitignore", "uploads/\n");
     command(&fixture.repo, "git", ["add", ".gitignore"]);
     command(&fixture.repo, "git", ["commit", "-m", "ignore uploads"]);
+    command(&fixture.repo, "git", ["push", "origin", "main"]);
     let added = fixture.wt(["add", "42"]);
     assert_success(&added);
     let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
@@ -1581,6 +1613,9 @@ fn clean_verifies_missing_pr_commits_on_github_without_fetching() {
     let fixture = Fixture::new();
     fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
     assert_success(&fixture.wt(["add", "feat/remote"]));
+    // `wt add` fetches the base; the checks below cover `clean` only.
+    let fetch_head = fixture.repo.join(".git/FETCH_HEAD");
+    let _ = fs::remove_file(&fetch_head);
     let path = fixture.worktrees.join("example/feat-remote");
     command(&path, "git", ["commit", "--allow-empty", "-m", "local"]);
     fs::write(fixture.bin.join("gh"), "#!/bin/sh\nif [ \"$1\" = api ]; then cat \"${0%/*}/comparison\"; else cat \"${0%/*}/prs.json\"; fi\n").unwrap();
@@ -1611,7 +1646,7 @@ fn clean_verifies_missing_pr_commits_on_github_without_fetching() {
     }
     assert_success(&fixture.wt(["clean", "--yes"]));
     assert!(!path.exists());
-    assert!(!fixture.repo.join(".git/FETCH_HEAD").exists());
+    assert!(!fetch_head.exists());
 }
 
 #[test]
@@ -1769,6 +1804,22 @@ impl Fixture {
             config,
             bin,
         }
+    }
+
+    /// Clones the shared remote into a sibling directory named `name`.
+    fn clone_repo(&self, name: &str) -> PathBuf {
+        let root = self.repo.parent().unwrap().to_path_buf();
+        let remote = root.join("remote.git");
+        let target = root.join(name);
+        command(
+            &root,
+            "git",
+            ["clone", remote.to_str().unwrap(), target.to_str().unwrap()],
+        );
+        command(&target, "git", ["config", "user.email", "dev@example.com"]);
+        command(&target, "git", ["config", "user.name", "Example Dev"]);
+        command(&target, "git", ["config", "commit.gpgsign", "false"]);
+        target
     }
 
     fn wt<const N: usize>(&self, args: [&str; N]) -> Output {
