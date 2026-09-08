@@ -1773,7 +1773,7 @@ impl Fixture {
         command(
             temp.path(),
             "git",
-            ["init", "--bare", remote.to_str().unwrap()],
+            ["init", "--bare", "-b", "main", remote.to_str().unwrap()],
         );
         command(
             &repo,
