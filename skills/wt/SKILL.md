@@ -15,11 +15,13 @@ existing suitable worktree and preserve unrelated changes.
 ## Create
 
 - Existing issue: run `wt add <issue-number-or-url>` from its repository.
+- Existing pull request: run `wt add <pr-number-or-url>` to check out its head
+  branch. Fork pull requests are refused; use `gh pr checkout` instead.
 - Standalone work: run `wt add <branch>` with an exact, descriptive branch name.
 
 Use the path printed by `wt add` as the working directory. A number or GitHub
-issue URL selects an issue; every other valid Git branch name creates a
-standalone worktree without a tracking issue.
+issue or pull request URL selects an issue or pull request; every other valid
+Git branch name creates a standalone worktree without a tracking issue.
 
 `.wtconfig` is optional. Run `wt init` only when the user asks to configure
 copied files, ports, Docker Compose, bootstrap, or teardown. If `wt` is not

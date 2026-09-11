@@ -36,9 +36,9 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Create a worktree for a GitHub issue or branch
+    /// Create a worktree for a GitHub issue, pull request, or branch
     Add {
-        /// Issue number, GitHub issue URL, or branch name
+        /// Issue or pull request number or URL, or branch name
         #[arg(add = ArgValueCompleter::new(completion::branches))]
         reference: String,
         /// Create the worktree without running its bootstrap command

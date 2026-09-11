@@ -35,6 +35,14 @@ struct Issue {
     number: u64,
     title: String,
     labels: Vec<Label>,
+    url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullHead {
+    head_ref_name: String,
+    is_cross_repository: bool,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +53,8 @@ struct Label {
 struct AddPlan {
     issue: Option<u64>,
     branch: String,
+    /// Fetch the branch from origin before checkout, as for a pull request head.
+    fetch: bool,
     path: PathBuf,
     compose_name: String,
 }
@@ -82,20 +92,20 @@ pub fn add(reference: &str, no_bootstrap: bool, verbose: bool) -> Result<()> {
     ui::heading(slug.rsplit('/').next().unwrap_or(&slug), &target_key);
     offer_setup(&repo_root)?;
     let plan = target_plan(&repo_root, &slug, target)?;
+    // A pull request's head branch often already has its issue's worktree.
+    if let Some(record) = store.records()?.into_iter().find(|record| {
+        record.repository.eq_ignore_ascii_case(&slug)
+            && record.branch == plan.branch
+            && record.path.exists()
+    }) {
+        println!("{}", record.path.display());
+        return Ok(());
+    }
     let config = Config::load(&repo_root)?;
-    let base = base_branch(&repo_root, &config, plan.issue)?;
     let config_hash = config.command_fingerprint()?;
     ensure_trusted_commands(&store, &slug, &config, config_hash.as_deref(), no_bootstrap)?;
     progress("Creating worktree", "Worktree created", || {
-        install_worktree(
-            &store,
-            &config,
-            &repo_root,
-            &slug,
-            &base,
-            &plan,
-            config_hash,
-        )
+        install_worktree(&store, &config, &repo_root, &slug, &plan, config_hash)
     })?;
     // Ports and the record are saved. Other worktrees can now finish setup.
     drop(lock);
@@ -118,6 +128,16 @@ fn target_plan(repo: &Path, repository: &str, target: AddTarget) -> Result<AddPl
             let issue = progress("Reading GitHub issue", "Issue loaded", || {
                 issue(repo, number, repository)
             })?;
+            // GitHub serves pull requests as issues; their URL tells them apart.
+            if issue.url.contains("/pull/") {
+                let branch = progress("Reading pull request", "Pull request loaded", || {
+                    pull_head(repo, number, repository)
+                })?;
+                return Ok(AddPlan {
+                    fetch: true,
+                    ..add_plan(repository, Some(number), branch)?
+                });
+            }
             issue_plan(repository, &issue)
         }
         AddTarget::Branch(branch) => add_plan(repository, None, branch),
@@ -147,6 +167,7 @@ fn add_plan(repository: &str, issue: Option<u64>, branch: String) -> Result<AddP
     let repo_name = repository.rsplit('/').next().unwrap_or("repository");
     Ok(AddPlan {
         issue,
+        fetch: false,
         path: config::worktree_root()?.join(repo_name).join(&directory),
         compose_name: compose_name(
             repository,
@@ -177,11 +198,10 @@ fn install_worktree(
     config: &Config,
     repo_root: &Path,
     repository: &str,
-    base: &str,
     plan: &AddPlan,
     config_hash: Option<String>,
 ) -> Result<()> {
-    create_worktree(repo_root, &plan.path, &plan.branch, base)?;
+    create_worktree(repo_root, config, plan)?;
     let setup = prepare_record(store, config, repo_root, plan, repository, config_hash);
     if let Err(error) = setup {
         let cleanup = run_git(
@@ -235,7 +255,12 @@ fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool, verbose: bool) 
     Ok(())
 }
 
-fn create_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
+fn create_worktree(repo: &Path, config: &Config, plan: &AddPlan) -> Result<()> {
+    let (path, branch) = (&plan.path, plan.branch.as_str());
+    if plan.fetch {
+        run_git(repo, ["fetch", "origin", branch])
+            .with_context(|| format!("pull request head branch {branch} is not on origin"))?;
+    }
     if local_branch_exists(repo, branch)? {
         run_git(repo, ["worktree", "add", path_str(path)?, branch])
     } else if remote_branch_exists(repo, branch)? {
@@ -253,7 +278,9 @@ fn create_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result
             ],
         )
     } else {
-        let start = starting_point(repo, base)?;
+        // Only new branches need a base, so existing branches skip its lookup.
+        let base = base_branch(repo, config, plan.issue)?;
+        let start = starting_point(repo, &base)?;
         run_git(
             repo,
             ["worktree", "add", "-b", branch, path_str(path)?, &start],
@@ -1328,24 +1355,50 @@ fn issue(repo_root: &Path, number: u64, slug: &str) -> Result<Issue> {
         "--repo",
         slug,
         "--json",
-        "number,title,state,labels",
+        "number,title,state,labels,url",
     ]))?;
     serde_json::from_slice(&output.stdout).context("parse issue details from gh")
+}
+
+/// Returns the head branch of a same-repository pull request.
+fn pull_head(repo_root: &Path, number: u64, slug: &str) -> Result<String> {
+    let output = run(Command::new("gh").current_dir(repo_root).args([
+        "pr",
+        "view",
+        &number.to_string(),
+        "--repo",
+        slug,
+        "--json",
+        "headRefName,isCrossRepository",
+    ]))?;
+    let head: PullHead =
+        serde_json::from_slice(&output.stdout).context("parse pull request details from gh")?;
+    if head.is_cross_repository {
+        bail!(
+            "pull request #{number} comes from a fork; check it out with gh pr checkout {number}"
+        );
+    }
+    Ok(head.head_ref_name)
 }
 
 fn issue_number(reference: &str, slug: &str) -> Result<u64> {
     if let Ok(number) = reference.parse() {
         return Ok(number);
     }
-    let prefix = format!("https://github.com/{slug}/issues/");
+    let expected = format!(
+        "expected a number or a https://github.com/{slug}/issues/<number> or /pull/<number> URL"
+    );
     let Some(path) = reference.strip_prefix("https://github.com/") else {
-        bail!("expected an issue number or a {prefix}<number> URL");
+        bail!("{expected}");
     };
-    let Some((repository, number)) = path.rsplit_once("/issues/") else {
-        bail!("expected an issue number or a {prefix}<number> URL");
+    let Some((repository, number)) = path
+        .rsplit_once("/issues/")
+        .or_else(|| path.rsplit_once("/pull/"))
+    else {
+        bail!("{expected}");
     };
     if !repository.eq_ignore_ascii_case(slug) {
-        bail!("expected an issue number or a {prefix}<number> URL");
+        bail!("{expected}");
     }
     number.parse().context("parse issue number from URL")
 }
@@ -1462,6 +1515,11 @@ mod tests {
             42
         );
         assert!(issue_number("https://github.com/acme/other/issues/42", "acme/example").is_err());
+        assert_eq!(
+            issue_number("https://github.com/Acme/Example/pull/7", "acme/example").unwrap(),
+            7
+        );
+        assert!(issue_number("https://github.com/acme/other/pull/7", "acme/example").is_err());
     }
 
     #[test]

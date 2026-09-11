@@ -291,6 +291,77 @@ fn add_tracks_an_existing_remote_branch() {
 }
 
 #[test]
+fn add_opens_a_pull_request_on_its_head_branch() {
+    let fixture = Fixture::new();
+    command(&fixture.repo, "git", ["checkout", "-b", "feat/shared"]);
+    fixture.write("shared.txt", "from pull request\n");
+    command(&fixture.repo, "git", ["add", "shared.txt"]);
+    command(&fixture.repo, "git", ["commit", "-m", "shared work"]);
+    command(
+        &fixture.repo,
+        "git",
+        ["push", "-u", "origin", "feat/shared"],
+    );
+    command(&fixture.repo, "git", ["checkout", "main"]);
+    command(&fixture.repo, "git", ["branch", "-D", "feat/shared"]);
+    // Without a local remote-tracking ref, only a fetch can find the head.
+    command(
+        &fixture.repo,
+        "git",
+        ["update-ref", "-d", "refs/remotes/origin/feat/shared"],
+    );
+    fixture.fake_pull_request("feat/shared", false);
+
+    let added = fixture.wt(["add", "https://github.com/acme/example/pull/7"]);
+
+    assert_success(&added);
+    let expected = fixture.worktrees.join("example/feat-shared");
+    assert_eq!(
+        String::from_utf8(added.stdout.clone()).unwrap(),
+        format!("{}\n", expected.display())
+    );
+    assert_eq!(
+        fs::read_to_string(expected.join("shared.txt")).unwrap(),
+        "from pull request\n"
+    );
+    assert_eq!(
+        git(&expected, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        "origin/feat/shared"
+    );
+    fixture.fail_gh_calls();
+    let reused = fixture.wt(["add", "7"]);
+    assert_success(&reused);
+    assert_eq!(reused.stdout, added.stdout);
+}
+
+#[test]
+fn add_rejects_fork_pull_requests() {
+    let fixture = Fixture::new();
+    fixture.fake_pull_request("feat/shared", true);
+
+    let added = fixture.wt(["add", "8"]);
+
+    assert!(!added.status.success());
+    assert!(String::from_utf8_lossy(&added.stderr).contains("gh pr checkout 8"));
+    assert!(!fixture.worktrees.exists());
+}
+
+#[test]
+fn add_reuses_the_issue_worktree_of_a_pull_request_head() {
+    let fixture = Fixture::new();
+    let issue = fixture.wt(["add", "42"]);
+    assert_success(&issue);
+    // The head is not on origin, so reuse must happen before any fetch.
+    fixture.fake_pull_request("fix/42-handle-empty-input", false);
+
+    let pull = fixture.wt(["add", "7"]);
+
+    assert_success(&pull);
+    assert_eq!(pull.stdout, issue.stdout);
+    assert!(!fixture.state.join("records/acme--example--7.json").exists());
+}
+
+#[test]
 fn add_starts_from_origin_even_when_the_local_base_branch_is_stale() {
     let fixture = Fixture::new();
     // origin/main moves ahead of the local main branch.
@@ -1872,7 +1943,18 @@ impl Fixture {
     fn fail_gh_repo_calls(&self) {
         fs::write(
             self.bin.join("gh"),
-            "#!/bin/sh\nif [ \"$1\" = repo ]; then exit 99; fi\nprintf '{\"number\":%s,\"title\":\"Handle empty input\",\"state\":\"OPEN\",\"labels\":[{\"name\":\"bug\"}]}\\n' \"$3\"\n",
+            "#!/bin/sh\nif [ \"$1\" = repo ]; then exit 99; fi\nprintf '{\"number\":%s,\"title\":\"Handle empty input\",\"state\":\"OPEN\",\"labels\":[{\"name\":\"bug\"}],\"url\":\"https://github.com/acme/example/issues/%s\"}\\n' \"$3\" \"$3\"\n",
+        )
+        .unwrap();
+    }
+
+    /// Serves every number as a pull request from `head`; other gh calls fail.
+    fn fake_pull_request(&self, head: &str, cross_repository: bool) {
+        fs::write(
+            self.bin.join("gh"),
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  issue) printf '{{\"number\":%s,\"title\":\"Shared view\",\"state\":\"OPEN\",\"labels\":[],\"url\":\"https://github.com/acme/example/pull/%s\"}}\\n' \"$3\" \"$3\" ;;\n  pr) printf '%s\\n' '{{\"headRefName\":\"{head}\",\"isCrossRepository\":{cross_repository}}}' ;;\n  *) exit 99 ;;\nesac\n"
+            ),
         )
         .unwrap();
     }
@@ -1910,7 +1992,7 @@ fn write_fake_gh(bin: &Path) {
     let path = bin.join("gh");
     fs::write(
         &path,
-        "#!/bin/sh\nif [ \"$1\" = repo ]; then\n  printf '%s\\n' '{\"nameWithOwner\":\"acme/example\",\"defaultBranchRef\":{\"name\":\"main\"}}'\nelse\n  printf '{\"number\":%s,\"title\":\"Handle empty input\",\"state\":\"OPEN\",\"labels\":[{\"name\":\"bug\"}]}\\n' \"$3\"\nfi\n",
+        "#!/bin/sh\nif [ \"$1\" = repo ]; then\n  printf '%s\\n' '{\"nameWithOwner\":\"acme/example\",\"defaultBranchRef\":{\"name\":\"main\"}}'\nelse\n  printf '{\"number\":%s,\"title\":\"Handle empty input\",\"state\":\"OPEN\",\"labels\":[{\"name\":\"bug\"}],\"url\":\"https://github.com/acme/example/issues/%s\"}\\n' \"$3\" \"$3\"\nfi\n",
     )
     .unwrap();
     #[cfg(unix)]

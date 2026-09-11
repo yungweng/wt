@@ -16,6 +16,7 @@ without deleting the branch or silently throwing away changes.
 | --- | --- |
 | `wt init` | Configure the current repository |
 | `wt add 42` | Create a worktree for issue 42 |
+| `wt add 57` | Check out pull request 57 in a worktree |
 | `wt add feat/my-change` | Create a worktree for a branch |
 | `wt list` | List worktrees created by `wt` |
 | `wt remove 42` | Safely remove by issue or branch |
@@ -105,11 +106,17 @@ Then start work from an issue number, URL, or branch name:
 ```sh
 cd "$(wt add 42)"
 # or: wt add https://github.com/acme/example-api/issues/42
+# or: wt add https://github.com/acme/example-api/pull/57
 # or: wt add feat/my-change
 ```
 
-Numbers and GitHub issue URLs select issues. Every other valid Git branch name
-creates a standalone worktree, so `wt add test` needs no issue.
+Numbers and GitHub issue or pull request URLs select issues or pull requests.
+Every other valid Git branch name creates a standalone worktree, so
+`wt add test` needs no issue.
+
+A pull request opens on its head branch, freshly fetched from `origin` and
+tracking it, so you can review, commit, and push. Pull requests from forks are
+refused; use `gh pr checkout` for those.
 
 `wt add` prints only the new path to stdout, so command substitution is safe.
 Progress and errors go to stderr. Common issue labels produce `fix/`, `feat/`,
