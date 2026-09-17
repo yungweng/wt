@@ -156,7 +156,11 @@ missing on `origin`. If the branch already exists locally or on `origin`,
 ```
 
 - `env` and `copy` select untracked files to copy. Paths must stay inside the
-  repository, point to regular files, and cannot be symlinks.
+  repository, point to regular files, and cannot be symlinks. Ignored files
+  named `*.local` or `*.local.*`, such as `CLAUDE.local.md` or
+  `.claude/settings.local.json`, are copied without configuration. Symlinked
+  files are copied as regular files. Files inside wholly ignored directories
+  and paths that already exist in the new worktree are skipped.
 - `port = KEY` rewrites a port stored in the primary env file. `KEY:DEFAULT`
   leases a process port through `.wt.env`; this form requires direnv.
 - `compose = true` gives each worktree a unique `COMPOSE_PROJECT_NAME`.

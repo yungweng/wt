@@ -1021,7 +1021,7 @@ fn tracked_files(repo: &Path) -> Result<Vec<PathBuf>> {
     nul_paths(&git(repo, ["ls-files", "-z"])?.stdout)
 }
 
-fn nul_paths(bytes: &[u8]) -> Result<Vec<PathBuf>> {
+pub(crate) fn nul_paths(bytes: &[u8]) -> Result<Vec<PathBuf>> {
     bytes
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
@@ -1070,7 +1070,7 @@ fn ignored_paths(repo: &Path, paths: &[PathBuf]) -> Result<HashSet<PathBuf>> {
     }
 }
 
-fn git<const N: usize>(repo: &Path, args: [&str; N]) -> Result<std::process::Output> {
+pub(crate) fn git<const N: usize>(repo: &Path, args: [&str; N]) -> Result<std::process::Output> {
     let output = Command::new("git").current_dir(repo).args(args).output()?;
     if output.status.success() {
         Ok(output)

@@ -604,6 +604,47 @@ fn list_all_does_not_call_gh() {
 }
 
 #[test]
+fn add_copies_ignored_local_files_without_config() {
+    let fixture = Fixture::new();
+    fixture.write(
+        ".git/info/exclude",
+        "CLAUDE.local.md\nsettings.local.json\nnode_modules/\n",
+    );
+    fixture.write("CLAUDE.local.md", "notes\n");
+    fixture.write(".claude/settings.local.json", "{}\n");
+    fixture.write("node_modules/pkg/index.local.js", "vendored\n");
+    fixture.write("unignored.local", "wip\n");
+    fs::create_dir_all(fixture.repo.join("linked")).unwrap();
+    std::os::unix::fs::symlink(
+        "../CLAUDE.local.md",
+        fixture.repo.join("linked/CLAUDE.local.md"),
+    )
+    .unwrap();
+
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    assert_eq!(
+        fs::read_to_string(path.join("CLAUDE.local.md")).unwrap(),
+        "notes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join(".claude/settings.local.json")).unwrap(),
+        "{}\n"
+    );
+    assert!(!path.join("node_modules").exists());
+    assert!(!path.join("unignored.local").exists());
+    assert!(!path.join("linked/CLAUDE.local.md").is_symlink());
+    assert_eq!(
+        fs::read_to_string(path.join("linked/CLAUDE.local.md")).unwrap(),
+        "notes\n"
+    );
+    assert_success(&fixture.wt(["remove", "42"]));
+    assert!(!path.exists());
+}
+
+#[test]
 fn remove_refuses_a_changed_copied_file() {
     let fixture = Fixture::new();
     fixture.write(".wtconfig", "[wt]\n\tenv = .env\n");

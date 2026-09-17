@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, parse_port_spec};
+use crate::{
+    config::{Config, parse_port_spec},
+    detection::{git, nul_paths},
+};
 
 const PROCESS_ENV: &str = ".wt.env";
 
@@ -34,8 +37,10 @@ pub fn prepare(
     reject_tracked_paths(config, target)?;
     let mut copied = copy_files(config, source, target)?;
     let assignments = assign_ports(config, source, used_ports)?;
-    for path in &copied {
-        rewrite_file(&target.join(path), &assignments)?;
+    if !assignments.is_empty() {
+        for path in &copied {
+            rewrite_file(&target.join(path), &assignments)?;
+        }
     }
     if assignments.iter().any(|assignment| assignment.process) {
         write_process_env(target, &assignments)?;
@@ -91,23 +96,60 @@ fn reject_tracked_paths(config: &Config, target: &Path) -> Result<()> {
 }
 
 fn copy_files(config: &Config, source: &Path, target: &Path) -> Result<Vec<PathBuf>> {
-    let paths = config.copied_files();
+    let mut paths = config.copied_files();
     for relative in &paths {
         let from = source.join(relative);
         let metadata = fs::symlink_metadata(&from)
             .with_context(|| format!("copy source does not exist: {}", relative.display()))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file() {
             bail!("copy source must be a regular file: {}", relative.display());
         }
-        let destination = target.join(relative);
-        fs::create_dir_all(
-            destination
-                .parent()
-                .context("copy destination has no parent")?,
-        )?;
-        fs::copy(&from, &destination).with_context(|| format!("copy {}", relative.display()))?;
+        copy_file(source, target, relative)?;
+    }
+    // Ignored `.local` files are private per-checkout settings, so every
+    // worktree gets them. Symlinks are copied as their target's contents;
+    // existing paths, e.g. tracked ones, are never replaced.
+    for relative in ignored_local_files(source)? {
+        let exists = fs::symlink_metadata(target.join(&relative)).is_ok();
+        if source.join(&relative).is_file() && !exists {
+            copy_file(source, target, &relative)?;
+            paths.push(relative);
+        }
     }
     Ok(paths)
+}
+
+fn copy_file(source: &Path, target: &Path, relative: &Path) -> Result<()> {
+    let destination = target.join(relative);
+    fs::create_dir_all(
+        destination
+            .parent()
+            .context("copy destination has no parent")?,
+    )?;
+    fs::copy(source.join(relative), &destination)
+        .with_context(|| format!("copy {}", relative.display()))?;
+    Ok(())
+}
+
+/// `--directory` lists wholly ignored directories such as `node_modules/`
+/// without entering them; they are not files and get skipped.
+fn ignored_local_files(source: &Path) -> Result<Vec<PathBuf>> {
+    let output = git(
+        source,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+            "--",
+            ":(glob)**/*.local",
+            ":(glob)**/*.local.*",
+        ],
+    )
+    .context("find ignored .local files")?;
+    nul_paths(&output.stdout)
 }
 
 fn assign_ports(
@@ -168,11 +210,18 @@ fn available_port(start: u16, unavailable: &HashSet<u16>) -> Result<u16> {
 }
 
 fn rewrite_file(path: &Path, assignments: &[Assignment]) -> Result<()> {
-    let mut contents = fs::read_to_string(path)?;
+    // Binary files have no ports to rewrite.
+    let Ok(original) = String::from_utf8(fs::read(path)?) else {
+        return Ok(());
+    };
+    let mut contents = original.clone();
     for assignment in assignments.iter().filter(|assignment| !assignment.process) {
         contents = replace_value(&contents, &assignment.key, &assignment.assigned.to_string());
     }
     contents = replace_local_ports(contents, assignments)?;
+    if contents == original {
+        return Ok(());
+    }
     fs::write(path, contents).with_context(|| format!("update {}", path.display()))
 }
 
