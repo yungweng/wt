@@ -24,11 +24,18 @@ without deleting the branch or silently throwing away changes.
 
 ## Install
 
-You need Git, the [GitHub CLI](https://cli.github.com/), and Rust 1.85 or newer.
+You need Git and the [GitHub CLI](https://cli.github.com/).
 [direnv](https://direnv.net/) is only required for process-port isolation.
 
 ```sh
 gh auth login
+brew install yungweng/tap/wt
+```
+
+Homebrew also installs tab completion for Bash, Zsh, and Fish. Without
+Homebrew, install with Cargo (Rust 1.85 or newer):
+
+```sh
 cargo install --git https://github.com/yungweng/wt
 ```
 
