@@ -1438,7 +1438,16 @@ fn branch_kind(label: &str) -> Option<&'static str> {
 fn slugify(title: &str) -> String {
     let mut slug = String::new();
     for character in title.chars().flat_map(char::to_lowercase) {
-        if character.is_alphanumeric() {
+        let transliteration = match character {
+            'ä' => "ae",
+            'ö' => "oe",
+            'ü' => "ue",
+            'ß' => "ss",
+            _ => "",
+        };
+        if !transliteration.is_empty() {
+            slug.push_str(transliteration);
+        } else if character.is_ascii_alphanumeric() {
             slug.push(character);
         } else if !slug.is_empty() && !slug.ends_with('-') {
             slug.push('-');
@@ -1485,7 +1494,7 @@ fn path_str(path: &Path) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddTarget, add_target, github_slug, issue_number};
+    use super::{AddTarget, add_target, github_slug, issue_number, slugify};
 
     #[test]
     fn parses_github_clone_urls() {
@@ -1529,5 +1538,15 @@ mod tests {
             AddTarget::Branch(branch) if branch == "feat/local-work"
         ));
         assert!(add_target("bad branch", "acme/example").is_err());
+    }
+
+    #[test]
+    fn slugs_are_ascii_and_transliterate_german_letters() {
+        let slug = slugify("Kiosk: Schulhof-Wahl bei laufenden Blöcken bucht sonst Freispiel");
+        assert!(slug.starts_with("kiosk-schulhof-wahl-bei-laufenden-bloecken-bucht"));
+        assert!(slug.is_ascii());
+        assert_eq!(slugify("Größe ÄÖÜ"), "groesse-aeoeue");
+        assert_eq!(slugify("Café naïve"), "caf-na-ve");
+        assert_eq!(slugify("日本"), "issue");
     }
 }
