@@ -22,6 +22,7 @@ without deleting the branch or silently throwing away changes.
 | `wt remove 42` | Safely remove by issue or branch |
 | `wt clean` | Preview and confirm removal of safely merged worktrees |
 | `wt clean --force` | Also remove merged worktrees with local changes |
+| `wt doctor` | Check a worktree for missing private files and shadowed ports |
 | `wt shell fish` | Print a shell function that changes into new worktrees |
 
 ## Install
@@ -166,6 +167,8 @@ missing on `origin`. If the branch already exists locally or on `origin`,
     base = main
     env = .env
     copy = web/.env.local
+    copy = config/certs
+    copy = **/*.pem
     compose = true
 
     port = API_PORT
@@ -178,14 +181,24 @@ missing on `origin`. If the branch already exists locally or on `origin`,
     disposable = web/node_modules
 ```
 
-- `env` and `copy` select untracked files to copy. Paths must stay inside the
-  repository, point to regular files, and cannot be symlinks. Ignored files
-  named `*.local` or `*.local.*`, such as `CLAUDE.local.md` or
-  `.claude/settings.local.json`, are copied without configuration. Symlinked
-  files are copied as regular files. Files inside wholly ignored directories
-  and paths that already exist in the new worktree are skipped.
-- `port = KEY` rewrites a port stored in the primary env file. `KEY:DEFAULT`
-  leases a process port through `.wt.env`; this form requires direnv.
+- `env` and `copy` select untracked paths to copy: a file, a directory (every
+  file below it), or a glob such as `**/*.pem` (its untracked matches). Paths
+  must stay inside the repository. Ignored files named `*.local` or
+  `*.local.*`, such as `CLAUDE.local.md` or `.claude/settings.local.json`, are
+  copied without configuration. A symlink that points outside the repository,
+  for example notes linked from a dotfiles directory, is recreated as the same
+  symlink so both checkouts share it; other symlinks are copied as regular
+  files. Files inside wholly ignored directories and paths that already exist
+  in the new worktree are skipped. A configured path that is missing from the
+  checkout is looked up again after `bootstrap`: files the setup command
+  generates get the same port rewrite and are managed like copied files. A
+  path that still does not exist only produces a warning.
+- `port = KEY` rewrites a port stored in the primary env file, together with
+  `localhost:<port>` and `127.0.0.1:<port>` references in every copied file.
+  `KEY:DEFAULT` leases a process port through `.wt.env`; this form requires
+  direnv. When `.envrc` loads `.wt.env`, the file lists every leased port and
+  the Compose project name, so values from user-wide env files loaded earlier
+  in `.envrc` cannot shadow the worktree's ports.
 - `compose = true` gives each worktree a unique `COMPOSE_PROJECT_NAME`.
 - `bootstrap` runs after creation; `teardown` runs before removal. `wt` asks
   again if either trusted command changes.
@@ -193,6 +206,31 @@ missing on `origin`. If the branch already exists locally or on `origin`,
 
 The default worktree root is `~/Developer/worktrees`. Change it with
 `wt init --root /absolute/path` or `WT_WORKTREE_ROOT`.
+
+If the repository uses direnv and its `.envrc` is allowed in the checkout,
+`wt add` runs `direnv allow` in the new worktree. The worktree's `.envrc` is
+byte-identical to the checkout's, so nothing new is trusted; a different
+`.envrc` still needs a manual `direnv allow`.
+
+## Check a worktree
+
+```sh
+wt doctor
+```
+
+Run it inside a worktree created by `wt`. It compares the worktree with the
+main checkout and reports:
+
+- Ignored files of the main checkout that the worktree lacks, such as
+  generated certificates or a local Compose file, minus `disposable` paths
+  and common caches. Add them as `copy` entries or copy them by hand.
+- Managed files that were deleted from the worktree.
+- An `.envrc` that direnv has not allowed, so `.wt.env` is not loaded.
+- Leased ports that the shell or `.envrc` overrides with another value. Docker
+  Compose prefers the environment over `.env`, so a user-wide env file with
+  `API_PORT=8080` silently sends every worktree to the same port.
+
+`wt doctor` exits unsuccessfully when it finds a problem.
 
 ## Progress and setup time
 
@@ -268,9 +306,10 @@ under “Ready to remove”, “Needs --force”, and “Skipped”, with one ta
 per worktree.
 
 “Needs --force” lists merged worktrees that fail the same file safety checks
-as `wt remove` (changed copied files, tracked changes, or unmanaged files) and
-records whose worktree path is missing. `wt clean --force` moves them to
-“Ready to remove” and shows what each one loses. The merge check runs first,
+as `wt remove` (changed copied files, tracked changes, or unmanaged files).
+`wt clean --force` moves them to “Ready to remove” and shows what each one
+loses. Records whose worktree directory is already gone have nothing left to
+lose and are always ready. The merge check runs first,
 so unmerged work is never offered, even with `--force`. Local changes also
 require a merged PR for the branch: a new branch without commits is an
 ancestor of the base, too, and may hold work in progress. If a forced candidate
@@ -290,7 +329,9 @@ the others, and exits unsuccessfully. Already removed worktrees stay removed.
 
 Without `--force`, `wt remove` refuses to delete a worktree with tracked
 changes, unknown files, modified copied files, or files outside `disposable`
-paths. Even forced removal keeps the Git branch.
+paths. Even forced removal keeps the Git branch. If the worktree directory
+was already deleted by hand, `wt remove` drops the record and Git's stale
+entry without teardown.
 
 Ignored directories containing only empty directories do not block removal.
 Other unmanaged ignored paths still block it, even when plain `git status`

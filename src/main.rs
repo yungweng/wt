@@ -3,6 +3,7 @@ mod cleanup;
 mod completion;
 mod config;
 mod detection;
+mod doctor;
 mod environment;
 mod shell;
 mod state;
@@ -82,6 +83,8 @@ enum Command {
         #[arg(long)]
         skip_teardown: bool,
     },
+    /// Check the current worktree for missing private files and shadowed ports
+    Doctor,
     /// Delete generated files moved aside by removal
     #[command(hide = true)]
     PurgeTrash { directory: std::path::PathBuf },
@@ -177,6 +180,7 @@ fn run() -> Result<()> {
             force,
             skip_teardown,
         } => app::remove(&reference, force, skip_teardown, cli.verbose),
+        Command::Doctor => doctor::run(),
         Command::PurgeTrash { directory } => {
             cleanup::purge(&directory);
             Ok(())

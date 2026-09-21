@@ -752,6 +752,218 @@ fn add_copies_ignored_local_files_without_config() {
 }
 
 #[test]
+fn add_copies_directories_globs_and_shared_symlinks() {
+    let fixture = Fixture::new();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let original_port = occupied.local_addr().unwrap().port();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tenv = .env\n\tcopy = certs\n\tcopy = \"**/*.pem\"\n\tport = APP_PORT\n",
+    );
+    fixture.write(".git/info/exclude", "*.local.md\ncerts/\n");
+    fixture.write(".env", &format!("APP_PORT={original_port}\n"));
+    fixture.write("certs/server.key", "key\n");
+    fixture.write(
+        "certs/nested/ca.conf",
+        &format!("issuer=http://localhost:{original_port}\n"),
+    );
+    fixture.write("keys/one.pem", "pem\n");
+    fixture.write("keys/deep/two.pem", "pem\n");
+    fixture.write("keys/skip.txt", "text\n");
+    let shared = fixture._temp.path().join("shared-notes.md");
+    fs::write(&shared, "shared\n").unwrap();
+    std::os::unix::fs::symlink(&shared, fixture.repo.join("notes.local.md")).unwrap();
+
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    let assigned = env_value(&fs::read_to_string(path.join(".env")).unwrap(), "APP_PORT")
+        .parse::<u16>()
+        .unwrap();
+    assert_ne!(assigned, original_port);
+    assert_eq!(
+        fs::read_to_string(path.join("certs/server.key")).unwrap(),
+        "key\n"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("certs/nested/ca.conf")).unwrap(),
+        format!("issuer=http://localhost:{assigned}\n")
+    );
+    assert!(path.join("keys/one.pem").is_file());
+    assert!(path.join("keys/deep/two.pem").is_file());
+    assert!(!path.join("keys/skip.txt").exists());
+    assert!(path.join("notes.local.md").is_symlink());
+    assert_eq!(fs::read_link(path.join("notes.local.md")).unwrap(), shared);
+    assert_eq!(fs::read_to_string(shared).unwrap(), "shared\n");
+
+    assert_success(&fixture.wt(["remove", "42"]));
+    assert!(!path.exists());
+}
+
+#[test]
+fn wt_env_lists_env_ports_when_envrc_loads_it_and_direnv_allows_the_worktree() {
+    let fixture = Fixture::new();
+    let original_port = unused_port();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tenv = .env\n\tcompose = true\n\tport = APP_PORT\n",
+    );
+    fixture.write(".env", &format!("APP_PORT={original_port}\n"));
+    fixture.write(".gitignore", "/.env\n/.wt.env\n");
+    fixture.write(".envrc", "dotenv_if_exists .wt.env\n");
+    command(&fixture.repo, "git", ["add", ".gitignore", ".envrc"]);
+    command(&fixture.repo, "git", ["commit", "-m", "direnv"]);
+    command(&fixture.repo, "git", ["push", "origin", "main"]);
+    fixture.fake_direnv(&["example"]);
+
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    let process = fs::read_to_string(path.join(".wt.env")).unwrap();
+    let env = fs::read_to_string(path.join(".env")).unwrap();
+    assert_eq!(env_value(&process, "APP_PORT"), env_value(&env, "APP_PORT"));
+    assert_eq!(
+        env_value(&process, "COMPOSE_PROJECT_NAME"),
+        "wt-42-acme-example"
+    );
+    let allowed = fs::read_to_string(fixture.bin.join("direnv-allow.log")).unwrap();
+    assert_eq!(
+        fs::canonicalize(allowed.trim()).unwrap(),
+        fs::canonicalize(&path).unwrap()
+    );
+
+    // A checkout whose .envrc direnv does not allow never allows the worktree.
+    fixture.fake_direnv(&[]);
+    fs::remove_file(fixture.bin.join("direnv-allow.log")).unwrap();
+    assert_success(&fixture.wt(["add", "43"]));
+    assert!(!fixture.bin.join("direnv-allow.log").exists());
+}
+
+#[test]
+fn bootstrap_generated_copy_paths_are_rewritten_and_managed() {
+    let fixture = Fixture::new();
+    let original_port = unused_port();
+    fixture.write(".env", &format!("APP_PORT={original_port}\n"));
+    let initialized = fixture.wt([
+        "init",
+        "--env",
+        ".env",
+        "--copy",
+        "generated/app.conf",
+        "--copy",
+        "never.conf",
+        "--port",
+        "APP_PORT",
+        "--bootstrap",
+        &format!("mkdir -p generated && printf 'URL=http://localhost:{original_port}\\n' > generated/app.conf"),
+        "--yes",
+    ]);
+    assert_success(&initialized);
+
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    let env = fs::read_to_string(path.join(".env")).unwrap();
+    let assigned = env_value(&env, "APP_PORT");
+    assert_eq!(
+        fs::read_to_string(path.join("generated/app.conf")).unwrap(),
+        format!("URL=http://localhost:{assigned}\n")
+    );
+    assert!(
+        String::from_utf8_lossy(&added.stderr).contains("never.conf"),
+        "{:?}",
+        added.stderr
+    );
+    let record = fs::read_to_string(fixture.state.join("records/acme--example--42.json")).unwrap();
+    assert!(record.contains("generated/app.conf"), "{record}");
+
+    assert_success(&fixture.wt(["remove", "42"]));
+    assert!(!path.exists());
+}
+
+#[test]
+fn remove_drops_the_record_of_a_missing_worktree() {
+    let fixture = Fixture::new();
+    let added = fixture.wt(["add", "feat/gone"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    command(
+        &fixture.repo,
+        "git",
+        ["worktree", "remove", path.to_str().unwrap()],
+    );
+
+    assert_success(&fixture.wt(["remove", "feat/gone"]));
+
+    let listed = String::from_utf8(fixture.wt(["list", "--porcelain"]).stdout).unwrap();
+    assert!(!listed.contains("feat/gone"), "{listed}");
+    assert!(!git(&fixture.repo, ["worktree", "list"]).contains("gone"));
+    assert_eq!(
+        git(&fixture.repo, ["branch", "--list", "feat/gone"]),
+        "feat/gone"
+    );
+}
+
+#[test]
+fn doctor_reports_missing_private_files_and_shadowed_ports() {
+    let fixture = Fixture::new();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let original_port = occupied.local_addr().unwrap().port();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tenv = .env\n\tport = APP_PORT\n\tdisposable = node_modules\n",
+    );
+    fixture.write(
+        ".git/info/exclude",
+        ".env\nsecrets.json\nnode_modules/\ncerts/\n*.log\n",
+    );
+    fixture.write(".env", &format!("APP_PORT={original_port}\n"));
+    fixture.write("secrets.json", "{}\n");
+    fixture.write("node_modules/pkg/index.js", "cached\n");
+    fixture.write("certs/server.key", "key\n");
+    fixture.write("server.log", "noise\n");
+    let added = fixture.wt(["add", "42"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+
+    let checked = fixture
+        .wt_command(["doctor"])
+        .current_dir(&path)
+        .env("APP_PORT", original_port.to_string())
+        .output()
+        .unwrap();
+    assert!(!checked.status.success());
+    let text = String::from_utf8_lossy(&checked.stdout);
+    assert!(text.contains("secrets.json"), "{text}");
+    assert!(text.contains("certs/"), "{text}");
+    assert!(!text.contains("node_modules"), "{text}");
+    assert!(!text.contains("server.log"), "{text}");
+    assert!(
+        text.contains(&format!("APP_PORT={original_port} in this shell")),
+        "{text}"
+    );
+
+    fs::write(path.join("secrets.json"), "{}\n").unwrap();
+    fs::create_dir_all(path.join("certs")).unwrap();
+    fs::write(path.join("certs/server.key"), "key\n").unwrap();
+    let healthy = fixture
+        .wt_command(["doctor"])
+        .current_dir(&path)
+        .env_remove("APP_PORT")
+        .output()
+        .unwrap();
+    assert_success(&healthy);
+    assert!(String::from_utf8_lossy(&healthy.stdout).contains("No problems found"));
+
+    let outside = fixture.wt(["doctor"]);
+    assert!(!outside.status.success());
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("main checkout"));
+}
+
+#[test]
 fn remove_refuses_a_changed_copied_file() {
     let fixture = Fixture::new();
     fixture.write(".wtconfig", "[wt]\n\tenv = .env\n");
@@ -979,11 +1191,13 @@ fn port_rewrites_do_not_cascade_between_adjacent_ports() {
 #[test]
 fn failed_setup_rolls_back_the_worktree_and_can_reuse_the_branch() {
     let fixture = Fixture::new();
-    fixture.write(".wtconfig", "[wt]\n\tcopy = missing.env\n");
+    fixture.write(".wtconfig", "[wt]\n\tenv = .env\n\tport = APP_PORT\n");
+    fixture.write(".env", "OTHER=1\n");
     let path = fixture.worktrees.join("example/fix-42-handle-empty-input");
 
     let failed = fixture.wt(["add", "42"]);
     assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("APP_PORT is missing from .env"));
     assert!(!path.exists());
     assert_eq!(
         git(
@@ -993,10 +1207,10 @@ fn failed_setup_rolls_back_the_worktree_and_can_reuse_the_branch() {
         "fix/42-handle-empty-input"
     );
 
-    fixture.write("missing.env", "READY=true\n");
+    fixture.write(".env", "APP_PORT=3000\n");
     let retried = fixture.wt(["add", "42"]);
     assert_success(&retried);
-    assert!(path.join("missing.env").exists());
+    assert!(path.join(".env").exists());
 }
 
 #[test]
@@ -1761,25 +1975,16 @@ fn clean_skips_current_base_detached_switched_and_missing_worktrees() {
         assert!(skipped.contains(branch), "{text}");
         assert!(root.join(branch).exists());
     }
-    let forced = text.split("Needs --force (1)").nth(1).unwrap();
+    // A missing directory has nothing to lose, so no --force is needed.
+    let ready = text.split("Ready to remove (1)").nth(1).unwrap();
     assert!(
-        forced
-            .split("Skipped (")
-            .next()
-            .unwrap()
-            .contains("missing"),
+        ready.split("Skipped (").next().unwrap().contains("missing"),
         "{text}"
     );
+    assert!(!text.contains("Needs --force"), "{text}");
     assert!(text.contains("worktree path is missing"), "{text}");
     assert!(text.contains("current worktree"), "{text}");
     assert!(text.contains("base branch"), "{text}");
-
-    let forced = fixture
-        .wt_command(["clean", "--yes", "--force"])
-        .current_dir(root.join("current/subdirectory"))
-        .output()
-        .unwrap();
-    assert_success(&forced);
     let listed = String::from_utf8(fixture.wt(["list", "--porcelain"]).stdout).unwrap();
     assert!(!listed.contains("\tmissing\t"), "{listed}");
     assert!(!git(&fixture.repo, ["worktree", "list"]).contains("/missing "));
@@ -2215,6 +2420,25 @@ impl Fixture {
         let path = self.repo.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    /// Installs a fake direnv that allows `.envrc` only in directories whose
+    /// basename is listed, and logs every `allow` with the directory path.
+    fn fake_direnv(&self, allowed: &[&str]) {
+        let names = allowed.join(" ");
+        let path = self.bin.join("direnv");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  status)\n    [ -f .envrc ] || exit 0\n    code=1\n    for name in {names}; do [ \"$name\" = \"$(basename \"$PWD\")\" ] && code=0; done\n    echo \"Found RC path $PWD/.envrc\"\n    echo \"Found RC allowed $code\" ;;\n  allow) echo \"$PWD\" >> \"${{0%/*}}/direnv-allow.log\" ;;\n  *) exit 99 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     fn fail_gh_calls(&self) {

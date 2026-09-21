@@ -791,14 +791,20 @@ pub fn planned_changes(
             template.source.display()
         ));
     }
-    if has_process_ports(config) && !file_contains(repo.join(".envrc"), "dotenv_if_exists .wt.env")?
+    if uses_wt_env(repo, config) && !file_contains(repo.join(".envrc"), "dotenv_if_exists .wt.env")?
     {
         changes.push("Add `dotenv_if_exists .wt.env` to .envrc".to_owned());
     }
-    if has_process_ports(config) && !file_has_line(repo.join(".gitignore"), "/.wt.env")? {
+    if uses_wt_env(repo, config) && !file_has_line(repo.join(".gitignore"), "/.wt.env")? {
         changes.push("Ignore /.wt.env".to_owned());
     }
     Ok(changes)
+}
+
+/// Process ports need `.wt.env`; a repository that already uses direnv gets
+/// it for env ports too, so leased ports win over user-wide env files.
+fn uses_wt_env(repo: &Path, config: &Config) -> bool {
+    has_process_ports(config) || (!config.ports.is_empty() && repo.join(".envrc").is_file())
 }
 
 pub fn apply_changes(repo: &Path, config: &Config, template: Option<&EnvTemplate>) -> Result<()> {
@@ -811,7 +817,7 @@ pub fn apply_changes(repo: &Path, config: &Config, template: Option<&EnvTemplate
             )
         })?;
     }
-    if has_process_ports(config) {
+    if uses_wt_env(repo, config) {
         append_line(repo.join(".envrc"), "dotenv_if_exists .wt.env")?;
         append_line(repo.join(".gitignore"), "/.wt.env")?;
     }

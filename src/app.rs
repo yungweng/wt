@@ -109,12 +109,14 @@ pub fn add(reference: &str, no_bootstrap: bool, verbose: bool) -> Result<()> {
     let config = Config::load(&repo_root)?;
     let config_hash = config.command_fingerprint()?;
     ensure_trusted_commands(&store, &slug, &config, config_hash.as_deref(), no_bootstrap)?;
-    progress("Creating worktree", "Worktree created", || {
+    let prepared = progress("Creating worktree", "Worktree created", || {
         install_worktree(&store, &config, &repo_root, &slug, &plan, config_hash)
     })?;
     // Ports and the record are saved. Other worktrees can now finish setup.
     drop(lock);
+    allow_direnv(&repo_root, &plan);
     run_bootstrap(&config, &plan, no_bootstrap, verbose)?;
+    finish_setup(&store, &config, &slug, &plan, &prepared)?;
     ui::ready(
         started,
         no_bootstrap && config.bootstrap.is_some(),
@@ -221,20 +223,22 @@ fn install_worktree(
     repository: &str,
     plan: &AddPlan,
     config_hash: Option<String>,
-) -> Result<()> {
+) -> Result<environment::Prepared> {
     create_worktree(repo_root, config, plan)?;
     let setup = prepare_record(store, config, repo_root, plan, repository, config_hash);
-    if let Err(error) = setup {
-        let cleanup = run_git(
-            repo_root,
-            ["worktree", "remove", "--force", path_str(&plan.path)?],
-        );
-        if let Err(cleanup) = cleanup {
-            bail!("{error:#}; rollback also failed: {cleanup:#}");
+    match setup {
+        Ok(prepared) => Ok(prepared),
+        Err(error) => {
+            let cleanup = run_git(
+                repo_root,
+                ["worktree", "remove", "--force", path_str(&plan.path)?],
+            );
+            if let Err(cleanup) = cleanup {
+                bail!("{error:#}; rollback also failed: {cleanup:#}");
+            }
+            Err(error)
         }
-        return Err(error);
     }
-    Ok(())
 }
 
 fn prepare_record(
@@ -244,7 +248,7 @@ fn prepare_record(
     plan: &AddPlan,
     repository: &str,
     config_hash: Option<String>,
-) -> Result<()> {
+) -> Result<environment::Prepared> {
     let prepared = environment::prepare(
         config,
         repo_root,
@@ -257,12 +261,67 @@ fn prepare_record(
         issue: plan.issue,
         branch: plan.branch.clone(),
         path: plan.path.clone(),
-        ports: prepared.ports,
-        copied_files: prepared.copied_files,
+        ports: prepared.ports(),
+        copied_files: prepared.copied_files.clone(),
         teardown: config.teardown.clone(),
         disposable: config.disposable.clone(),
         config_hash,
-    })
+    })?;
+    Ok(prepared)
+}
+
+/// direnv only loads an `.envrc` it was told to allow. The worktree's copy is
+/// identical to the checkout's, so an allowed checkout allows the worktree.
+fn allow_direnv(repo_root: &Path, plan: &AddPlan) {
+    if !plan.path.join(".envrc").is_file() {
+        return;
+    }
+    match environment::direnv_allowed(repo_root) {
+        Ok(Some(true)) => {}
+        _ => return,
+    }
+    let result = progress("Allowing direnv", "direnv allowed", || {
+        environment::allow_direnv(repo_root, &plan.path)
+    });
+    if let Err(error) = result {
+        ui::warn(&format!("{error:#}; run direnv allow in the worktree"));
+    }
+}
+
+/// Configured copy paths that bootstrap generated get their ports rewritten
+/// and join the managed files, so removal treats them like copied files.
+fn finish_setup(
+    store: &Store,
+    config: &Config,
+    repository: &str,
+    plan: &AddPlan,
+    prepared: &environment::Prepared,
+) -> Result<()> {
+    if prepared.pending.is_empty() {
+        return Ok(());
+    }
+    let _lock = store.lock()?;
+    let mut record = match plan.issue {
+        Some(issue) => store.find_issue(repository, issue)?,
+        None => store.find_branch(repository, &plan.branch)?,
+    }
+    .context("worktree record disappeared during setup")?;
+    let missing = environment::complete(
+        config,
+        &plan.path,
+        &plan.compose_name,
+        &prepared.assignments,
+        &prepared.pending,
+        &mut record.copied_files,
+    )?;
+    store.save(&record)?;
+    for path in missing {
+        ui::warn(&format!(
+            "configured copy path not found in checkout or after bootstrap: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn run_bootstrap(config: &Config, plan: &AddPlan, skipped: bool, verbose: bool) -> Result<()> {
@@ -507,6 +566,18 @@ pub fn remove(reference: &str, force: bool, skip_teardown: bool, verbose: bool) 
         Err(_) => store.find_branch(&repository, reference)?,
     }
     .with_context(|| format!("no managed worktree for {reference}"))?;
+    if !record.path.exists() {
+        // Nothing is left to check, tear down, or lose: only the records remain.
+        run_git(&repo_root, ["worktree", "prune"])?;
+        store.delete(&record)?;
+        if std::io::stderr().is_terminal() {
+            eprintln!(
+                "{} Worktree path was missing; record removed, branch kept",
+                style("◇", 32)
+            );
+        }
+        return Ok(());
+    }
     if !force {
         progress("Checking worktree", "Safety checks passed", || {
             ensure_safe_to_remove(&record)
@@ -557,10 +628,12 @@ struct Candidate {
 }
 
 impl Candidate {
+    /// A missing directory has nothing left to lose, so only local changes
+    /// need `--force`.
     fn needs_force(&self) -> bool {
         match &self.inspection {
             Inspection::Merged { changes, .. } => !changes.is_empty(),
-            Inspection::Missing => true,
+            Inspection::Missing => false,
         }
     }
 
@@ -700,7 +773,7 @@ pub fn clean(
     println!();
     if !forced.is_empty() {
         println!(
-            "{} merged worktree(s) kept for local changes or missing paths. Use wt clean --force to remove them too.",
+            "{} merged worktree(s) kept for local changes. Use wt clean --force to remove them too.",
             forced.len()
         );
     }
@@ -1480,16 +1553,47 @@ fn blocking_changes(record: &Record) -> Result<Vec<String>> {
         if kind != "??" && kind != "!!" {
             changes.push(format!("worktree contains tracked changes: {path}"));
         } else if !is_removable_path(Path::new(&path), record) {
-            if kind == "!!"
-                && path.ends_with('/')
-                && contains_only_directories(&record.path.join(path.trim_end_matches('/')))?
-            {
-                continue;
+            if path.ends_with('/') {
+                let directory = Path::new(path.trim_end_matches('/'));
+                if kind == "!!" && contains_only_directories(&record.path.join(directory))? {
+                    continue;
+                }
+                // A copied directory shows up collapsed; its files are managed.
+                if contains_only_managed_files(&record.path, directory, record)? {
+                    continue;
+                }
             }
             changes.push(format!("worktree contains an unmanaged file: {path}"));
         }
     }
     Ok(changes)
+}
+
+/// Whether every file below `directory` (relative to the worktree) is a
+/// managed copied file, without following symlinked directories.
+fn contains_only_managed_files(root: &Path, directory: &Path, record: &Record) -> Result<bool> {
+    let path = root.join(directory);
+    let metadata =
+        fs::symlink_metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    let mut managed = false;
+    for entry in fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let relative = directory.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if !contains_only_managed_files(root, &relative, record)? {
+                return Ok(false);
+            }
+        } else if record.copied_files.contains_key(&relative) {
+            managed = true;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(managed)
 }
 
 fn contains_only_directories(path: &Path) -> Result<bool> {

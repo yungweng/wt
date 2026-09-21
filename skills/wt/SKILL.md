@@ -28,6 +28,14 @@ Git branch name creates a standalone worktree without a tracking issue.
 copied files, ports, Docker Compose, bootstrap, or teardown. If `wt` is not
 installed, report that blocker.
 
+## Check
+
+Run `wt doctor` inside a worktree when services fail to start, ports collide,
+or local files seem missing. It lists ignored files of the main checkout that
+the worktree lacks, a blocked `.envrc`, and leased ports that the shell or
+`.envrc` shadows. Fix what it reports; add recurring files as `copy` entries
+in `.wtconfig`.
+
 ## List and remove
 
 Use `wt list` to inspect managed worktrees. Remove one with

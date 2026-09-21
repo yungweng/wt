@@ -194,6 +194,15 @@ pub fn ready(started: Instant, skipped: bool, url: Option<&str>) {
     }
 }
 
+/// Prints a non-fatal problem inside the progress rail.
+pub fn warn(message: &str) {
+    if terminal() {
+        eprintln!("│ {} {message}", style("!", 33));
+    } else {
+        eprintln!("warning: {message}");
+    }
+}
+
 /// Prints the issue or pull request URL on stderr; terminals make it clickable.
 pub fn link(url: Option<&str>) {
     if let Some(url) = url {
