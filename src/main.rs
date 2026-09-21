@@ -4,6 +4,7 @@ mod completion;
 mod config;
 mod detection;
 mod environment;
+mod shell;
 mod state;
 mod ui;
 
@@ -62,6 +63,9 @@ enum Command {
         /// Remove the previewed candidates without prompting
         #[arg(long)]
         yes: bool,
+        /// Also remove merged worktrees with local changes or missing paths
+        #[arg(long)]
+        force: bool,
         /// Do not run configured teardown commands
         #[arg(long)]
         skip_teardown: bool,
@@ -77,6 +81,18 @@ enum Command {
         /// Do not run the configured teardown command
         #[arg(long)]
         skip_teardown: bool,
+    },
+    /// Delete generated files moved aside by removal
+    #[command(hide = true)]
+    PurgeTrash { directory: std::path::PathBuf },
+    /// Print a shell function that changes into the directory after wt add
+    #[command(after_help = "Setup:\n  \
+        fish  add to ~/.config/fish/config.fish:  wt shell fish | source\n  \
+        zsh   add to ~/.zshrc:                    eval \"$(wt shell zsh)\"\n  \
+        bash  add to ~/.bashrc:                   eval \"$(wt shell bash)\"")]
+    Shell {
+        /// Shell to integrate with
+        shell: shell::Shell,
     },
 }
 
@@ -153,12 +169,21 @@ fn run() -> Result<()> {
         Command::Clean {
             dry_run,
             yes,
+            force,
             skip_teardown,
-        } => app::clean(dry_run, yes, skip_teardown, cli.verbose),
+        } => app::clean(dry_run, yes, force, skip_teardown, cli.verbose),
         Command::Remove {
             reference,
             force,
             skip_teardown,
         } => app::remove(&reference, force, skip_teardown, cli.verbose),
+        Command::PurgeTrash { directory } => {
+            cleanup::purge(&directory);
+            Ok(())
+        }
+        Command::Shell { shell } => {
+            print!("{}", shell::init(shell));
+            Ok(())
+        }
     }
 }

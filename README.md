@@ -21,6 +21,8 @@ without deleting the branch or silently throwing away changes.
 | `wt list` | List worktrees created by `wt` |
 | `wt remove 42` | Safely remove by issue or branch |
 | `wt clean` | Preview and confirm removal of safely merged worktrees |
+| `wt clean --force` | Also remove merged worktrees with local changes |
+| `wt shell fish` | Print a shell function that changes into new worktrees |
 
 ## Install
 
@@ -95,6 +97,26 @@ In terminals supporting OSC 8 hyperlinks, issue numbers in `wt list` and
 `wt clean` link to their GitHub issues. Links are built locally, without
 network requests. Redirected output and `--porcelain` remain plain text.
 
+## Change into new worktrees
+
+A program cannot change its shell's directory, so `wt shell` prints a small
+`wt` function that runs `wt add` and then changes into the printed path.
+Add one line to your shell's startup file and open a new shell:
+
+| Shell | File | Line |
+| --- | --- | --- |
+| Fish | `~/.config/fish/config.fish` | `wt shell fish \| source` |
+| Zsh | `~/.zshrc` | `eval "$(wt shell zsh)"` |
+| Bash | `~/.bashrc` | `eval "$(wt shell bash)"` |
+
+`wt add 42` then creates the worktree and changes into it; for an existing
+worktree it only changes into it. Other subcommands, failures, and `--help`
+pass through unchanged. When stdout is not a terminal, for example in
+`cd "$(wt add 42)"` or a pipe, the function prints the path as before, so
+scripts behave the same with or without it. The line generates the function
+from the installed binary, so it stays current after upgrades. Bash 3.2, the
+version macOS ships, is supported; use `eval` there, not `source <(...)`.
+
 ## Start a worktree
 
 Run the setup wizard once inside a GitHub repository:
@@ -126,7 +148,8 @@ tracking it, so you can review, commit, and push. Pull requests from forks are
 refused; use `gh pr checkout` for those.
 
 `wt add` prints only the new path to stdout, so command substitution is safe.
-Progress and errors go to stderr. Common issue labels produce `fix/`, `feat/`,
+Progress, errors, and the issue or pull request URL go to stderr. The URL
+appears after setup, and also when the worktree already exists. Common issue labels produce `fix/`, `feat/`,
 or `docs/` branches; other issues use `work/`. A branch name skips issue lookup
 and starts at `wt.base`, or at the current branch when no base is configured.
 `wt` fetches the base from `origin` first, so new worktrees always start at
@@ -189,10 +212,14 @@ can be added while it runs. Adds and removals for the same worktree still wait
 for its bootstrap to finish.
 
 Normal removal shows separate timings for safety checks, teardown, generated-file
-cleanup, and Git removal. Generated-file cleanup uses at most four workers and
-waits for them to finish before removing the worktree. Symlinks are unlinked,
-not followed. Cleanup failures report the affected path and keep the state record.
-Forced removal continues to delegate directly to Git.
+cleanup, and Git removal. Generated files (`disposable` paths) are moved into a
+`.wt-trash` directory next to the worktree, which takes milliseconds even for
+large `node_modules` trees. A detached background process then deletes the
+trash with at most four workers; interrupted deletions are retried by the next
+removal. Paths on another filesystem are deleted in place. Symlinks are
+unlinked, not followed. Cleanup failures report the affected path and keep
+the state record. Forced removal also moves generated files aside and lets Git
+delete everything else.
 
 Bootstrap time includes the repository's configured setup command. A fresh
 frontend dependency installation can take much longer than Git checkout.
@@ -211,6 +238,7 @@ build tools and dependencies. Skipping bootstrap does not make them ready.
 wt clean --dry-run  # Preview candidates and reasons for skipped worktrees
 wt clean            # Preview, then ask before removal (default: No)
 wt clean --yes      # Remove eligible candidates without prompting
+wt clean --force    # Also remove merged worktrees with local changes
 ```
 
 Cleanup covers `wt`-managed worktrees in the current repository and clone.
@@ -235,15 +263,26 @@ Branches with no commits ahead of the base also qualify,
 even if no PR was created. Age alone never qualifies a worktree.
 
 Cleanup skips locked worktrees, the current worktree, the base branch, detached or switched
-branches, missing paths, other clones, and worktrees that fail the same file
-safety checks as `wt remove`. The preview groups candidates under “Ready to
-remove” and “Skipped”, with one table row per worktree. Repeated worktree paths
-are omitted; use `wt list` to see them.
-`--dry-run` never runs teardown or removes files. Non-interactive removal
-requires `--yes`; there is no `--force` option.
+branches, other clones, and unmerged branches. The preview groups worktrees
+under “Ready to remove”, “Needs --force”, and “Skipped”, with one table row
+per worktree.
+
+“Needs --force” lists merged worktrees that fail the same file safety checks
+as `wt remove` (changed copied files, tracked changes, or unmanaged files) and
+records whose worktree path is missing. `wt clean --force` moves them to
+“Ready to remove” and shows what each one loses. The merge check runs first,
+so unmerged work is never offered, even with `--force`. Local changes also
+require a merged PR for the branch: a new branch without commits is an
+ancestor of the base, too, and may hold work in progress. If a forced candidate
+gains new changes after the preview, for example from its teardown, it is kept.
+Missing worktrees only lose their `wt` record and Git's stale worktree entry
+(`git worktree prune`). Repeated worktree paths are omitted; use `wt list` to
+see them. `--dry-run` never runs teardown or removes files. Non-interactive
+removal requires `--yes`, also together with `--force`.
 
 Removal rechecks candidates after confirmation, runs trusted teardown commands,
-and keeps all branches. Use `--skip-teardown` to leave services running.
+and keeps all branches. Up to four worktrees are removed in parallel behind a
+single status line; `--verbose` removes them one at a time with raw logs. Use `--skip-teardown` to leave services running.
 If a candidate changes or removal fails, cleanup reports it, continues with
 the others, and exits unsuccessfully. Already removed worktrees stay removed.
 

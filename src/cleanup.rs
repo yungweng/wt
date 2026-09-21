@@ -1,14 +1,95 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 
+/// Directory next to a worktree that holds generated files awaiting deletion.
+pub fn trash_dir(worktree: &Path) -> Option<PathBuf> {
+    Some(worktree.parent()?.join(".wt-trash"))
+}
+
+/// Move the configured paths into `trash` so removal does not wait for large
+/// generated trees. Paths on another filesystem are deleted in place.
+pub fn trash_paths(root: &Path, paths: &[PathBuf], trash: &Path) -> Result<()> {
+    let roots = removal_roots(root, paths)?;
+    if roots.is_empty() {
+        return Ok(());
+    }
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos());
+    let batch = trash.join(format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&batch).with_context(|| format!("create {}", batch.display()))?;
+    for (index, path) in roots.iter().enumerate() {
+        let source = root.join(path);
+        match fs::rename(&source, batch.join(index.to_string())) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+                remove_roots(root, std::slice::from_ref(path))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", source.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delete trashed files in a detached process that outlives this command.
+pub fn purge_in_background(trash: &Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command
+        .arg("purge-trash")
+        .arg(trash)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // Leftovers are retried by the next removal, so a failed start is harmless.
+    let _ = command.spawn();
+}
+
+/// Delete everything in `trash`. Concurrent purges may race, so errors only
+/// leave entries for a later purge.
+pub fn purge(trash: &Path) {
+    // Never empty an arbitrary directory passed to the hidden command.
+    if trash.file_name() != Some(".wt-trash".as_ref()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(trash) else {
+        return;
+    };
+    let names = entries
+        .filter_map(|entry| Some(PathBuf::from(entry.ok()?.file_name())))
+        .collect::<Vec<_>>();
+    let _ = remove_paths(trash, &names);
+    let _ = fs::remove_dir(trash);
+}
+
 /// Remove only the configured paths, without following directory symlinks.
 pub fn remove_paths(root: &Path, paths: &[PathBuf]) -> Result<()> {
+    let roots = removal_roots(root, paths)?;
+    remove_roots(root, &roots)
+}
+
+/// Deduplicated top-level paths, refusing any that sit below a symlink.
+fn removal_roots(root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut paths = paths.to_vec();
     paths.sort();
     paths.dedup();
@@ -40,7 +121,10 @@ pub fn remove_paths(root: &Path, paths: &[PathBuf]) -> Result<()> {
             roots.push(path);
         }
     }
+    Ok(roots)
+}
 
+fn remove_roots(root: &Path, roots: &[PathBuf]) -> Result<()> {
     let mut tasks = Vec::new();
     let mut parents = Vec::new();
     for path in roots {

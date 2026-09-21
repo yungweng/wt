@@ -1,5 +1,5 @@
 use std::{
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -118,8 +118,36 @@ pub fn display_path(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
+thread_local! {
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Suppress step progress on this thread, for work that runs in parallel.
+pub fn set_quiet(quiet: bool) {
+    QUIET.set(quiet);
+}
+
+pub fn quiet() -> bool {
+    QUIET.get()
+}
+
 pub fn terminal() -> bool {
-    std::io::stderr().is_terminal()
+    std::io::stderr().is_terminal() && !QUIET.get()
+}
+
+/// Redraws a single status line, as for parallel work.
+pub fn status(label: &str, started: Instant) {
+    if interactive() {
+        let frames = ["◒", "◐", "◓", "◑"];
+        let frame = frames[(started.elapsed().as_millis() / 100) as usize % frames.len()];
+        eprint!("\r\x1b[2K{}", line(frame, label, started, 36));
+    }
+}
+
+pub fn clear_status() {
+    if interactive() {
+        eprint!("\r\x1b[2K");
+    }
 }
 
 pub fn stdout_style(text: &str, code: u8) -> String {
@@ -148,7 +176,7 @@ pub fn heading(repository: &str, reference: &str) {
     }
 }
 
-pub fn ready(started: Instant, skipped: bool) {
+pub fn ready(started: Instant, skipped: bool, url: Option<&str>) {
     if terminal() {
         let label = if skipped {
             "Created · setup skipped"
@@ -156,10 +184,21 @@ pub fn ready(started: Instant, skipped: bool) {
             "Ready"
         };
         eprintln!(
-            "│\n└ {} {}\n",
+            "│\n└ {} {}{}\n",
             style(label, 32),
-            style(&format!("in {:.1}s", started.elapsed().as_secs_f64()), 2)
+            style(&format!("in {:.1}s", started.elapsed().as_secs_f64()), 2),
+            url.map_or_else(String::new, |url| format!("  {}", style(url, 4)))
         );
+    } else {
+        link(url);
+    }
+}
+
+/// Prints the issue or pull request URL on stderr; terminals make it clickable.
+pub fn link(url: Option<&str>) {
+    if let Some(url) = url {
+        // Optional output: a closed stderr must not fail the command.
+        let _ = writeln!(std::io::stderr(), "{}", style(url, 4));
     }
 }
 

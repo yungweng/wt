@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
+    cleanup,
     config::{self, Config},
     detection::{self, EnvTemplate, Report},
     environment,
@@ -57,6 +58,8 @@ struct AddPlan {
     fetch: bool,
     path: PathBuf,
     compose_name: String,
+    /// GitHub page of the issue or pull request, shown after setup.
+    url: Option<String>,
 }
 
 struct EnvironmentAnswers {
@@ -85,6 +88,7 @@ pub fn add(reference: &str, no_bootstrap: bool, verbose: bool) -> Result<()> {
     let lock = store.lock()?;
     if let Some(record) = find_record(&store, &slug, &target)? {
         if record.path.exists() {
+            ui::link(record_url(&record).as_deref());
             println!("{}", record.path.display());
             return Ok(());
         }
@@ -98,6 +102,7 @@ pub fn add(reference: &str, no_bootstrap: bool, verbose: bool) -> Result<()> {
             && record.branch == plan.branch
             && record.path.exists()
     }) {
+        ui::link(plan.url.as_deref());
         println!("{}", record.path.display());
         return Ok(());
     }
@@ -110,7 +115,11 @@ pub fn add(reference: &str, no_bootstrap: bool, verbose: bool) -> Result<()> {
     // Ports and the record are saved. Other worktrees can now finish setup.
     drop(lock);
     run_bootstrap(&config, &plan, no_bootstrap, verbose)?;
-    ui::ready(started, no_bootstrap && config.bootstrap.is_some());
+    ui::ready(
+        started,
+        no_bootstrap && config.bootstrap.is_some(),
+        plan.url.as_deref(),
+    );
     println!("{}", plan.path.display());
     Ok(())
 }
@@ -135,6 +144,7 @@ fn target_plan(repo: &Path, repository: &str, target: AddTarget) -> Result<AddPl
                 })?;
                 return Ok(AddPlan {
                     fetch: true,
+                    url: Some(issue.url),
                     ..add_plan(repository, Some(number), branch)?
                 });
             }
@@ -159,7 +169,17 @@ fn base_branch(repo: &Path, config: &Config, issue: Option<u64>) -> Result<Strin
 }
 
 fn issue_plan(repository: &str, issue: &Issue) -> Result<AddPlan> {
-    add_plan(repository, Some(issue.number), branch_name(issue))
+    Ok(AddPlan {
+        url: Some(issue.url.clone()),
+        ..add_plan(repository, Some(issue.number), branch_name(issue))?
+    })
+}
+
+/// Built locally: GitHub redirects issue URLs of pull requests to the PR.
+fn record_url(record: &Record) -> Option<String> {
+    record
+        .issue
+        .map(|number| format!("https://github.com/{}/issues/{number}", record.repository))
 }
 
 fn add_plan(repository: &str, issue: Option<u64>, branch: String) -> Result<AddPlan> {
@@ -168,6 +188,7 @@ fn add_plan(repository: &str, issue: Option<u64>, branch: String) -> Result<AddP
     Ok(AddPlan {
         issue,
         fetch: false,
+        url: None,
         path: config::worktree_root()?.join(repo_name).join(&directory),
         compose_name: compose_name(
             repository,
@@ -518,7 +539,64 @@ struct PullRequest {
     is_cross_repository: bool,
 }
 
-pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Result<()> {
+/// What `wt clean` found for a worktree that may be removed.
+enum Inspection {
+    /// Merged into the base. Non-empty `changes` would be lost and need `--force`.
+    Merged {
+        head: String,
+        reason: String,
+        changes: Vec<String>,
+    },
+    /// The worktree directory no longer exists; only its records remain.
+    Missing,
+}
+
+struct Candidate {
+    record: Record,
+    inspection: Inspection,
+}
+
+impl Candidate {
+    fn needs_force(&self) -> bool {
+        match &self.inspection {
+            Inspection::Merged { changes, .. } => !changes.is_empty(),
+            Inspection::Missing => true,
+        }
+    }
+
+    fn reason(&self) -> String {
+        match &self.inspection {
+            Inspection::Merged {
+                reason, changes, ..
+            } => match changes.as_slice() {
+                [] => reason.clone(),
+                [change] => format!("{reason}; {}", short_reason(change)),
+                [change, rest @ ..] => {
+                    format!("{reason}; {} (+{} more)", short_reason(change), rest.len())
+                }
+            },
+            Inspection::Missing => "worktree path is missing".to_owned(),
+        }
+    }
+}
+
+fn short_reason(reason: &str) -> String {
+    reason
+        .replace("worktree contains an unmanaged file: ", "Unmanaged: ")
+        .replace("worktree contains tracked changes: ", "Modified: ")
+        .replace(
+            "no merged PR found for this branch into ",
+            "No merged PR into ",
+        )
+}
+
+pub fn clean(
+    dry_run: bool,
+    yes: bool,
+    force: bool,
+    skip_teardown: bool,
+    verbose: bool,
+) -> Result<()> {
     let repo = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let repository = repository_slug(&repo)?;
     let store = Store::open_readonly()?;
@@ -541,9 +619,7 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
     )
     .with_context(|| format!("cannot resolve base {base}; update it before running wt clean"))?;
     let checks = MergeChecks::default();
-    let mut candidates = Vec::new();
-    let mut skipped = Vec::new();
-    // Read-only inspection is bounded to four workers; removal stays serial.
+    // Read-only inspection is bounded to four workers.
     let inspections = std::thread::scope(|scope| -> Result<Vec<_>> {
         let workers = records
             .chunks(records.len().div_ceil(4))
@@ -567,23 +643,48 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
         }
         Ok(results)
     })?;
+    let mut candidates = Vec::new();
+    let mut forced = Vec::new();
+    let mut skipped = Vec::new();
     for (record, inspection) in records.into_iter().zip(inspections) {
         match inspection {
-            Ok((head, reason)) => candidates.push((record, head, reason)),
+            Ok(inspection) => {
+                let candidate = Candidate { record, inspection };
+                if candidate.needs_force() && !force {
+                    forced.push(candidate);
+                } else {
+                    candidates.push(candidate);
+                }
+            }
             Err(error) => skipped.push((record, format!("{error:#}"))),
         }
     }
+    let rows = |candidates: &[Candidate]| {
+        candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.record.issue,
+                    candidate.record.branch.clone(),
+                    candidate.reason(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     println!("{}", ui::stdout_style(&repository, 1));
     if !candidates.is_empty() {
         println!(
             "\n{}",
             ui::stdout_style(&format!("Ready to remove ({})", candidates.len()), 32)
         );
-        let rows = candidates
-            .iter()
-            .map(|(record, _, reason)| (record.issue, record.branch.clone(), reason.clone()))
-            .collect::<Vec<_>>();
-        ui::worktree_table(&repository, &rows, "REASON");
+        ui::worktree_table(&repository, &rows(&candidates), "REASON");
+    }
+    if !forced.is_empty() {
+        println!(
+            "\n{}",
+            ui::stdout_style(&format!("Needs --force ({})", forced.len()), 33)
+        );
+        ui::worktree_table(&repository, &rows(&forced), "REASON");
     }
     if !skipped.is_empty() {
         println!(
@@ -592,26 +693,24 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
         );
         let rows = skipped
             .iter()
-            .map(|(record, reason)| {
-                (
-                    record.issue,
-                    record.branch.clone(),
-                    reason
-                        .replace("worktree contains an unmanaged file: ", "Unmanaged: ")
-                        .replace("worktree contains tracked changes: ", "Modified: ")
-                        .replace(
-                            "no merged PR found for this branch into ",
-                            "No merged PR into ",
-                        ),
-                )
-            })
+            .map(|(record, reason)| (record.issue, record.branch.clone(), short_reason(reason)))
             .collect::<Vec<_>>();
         ui::worktree_table(&repository, &rows, "REASON");
     }
     println!();
+    if !forced.is_empty() {
+        println!(
+            "{} merged worktree(s) kept for local changes or missing paths. Use wt clean --force to remove them too.",
+            forced.len()
+        );
+    }
     if candidates.is_empty() {
         println!("No safely merged worktrees to remove.");
         return Ok(());
+    }
+    let losing = candidates.iter().filter(|c| c.needs_force()).count();
+    if losing > 0 {
+        println!("{losing} candidate(s) lose the local changes shown above.");
     }
     println!("{} candidate(s). Branches will be kept.", candidates.len());
     if dry_run {
@@ -630,59 +729,160 @@ pub fn clean(dry_run: bool, yes: bool, skip_teardown: bool, verbose: bool) -> Re
         }
     }
     let store = Store::open()?;
-    let mut removed = 0;
-    let mut failed = 0;
-    for (preview, head, _) in candidates {
-        let result = (|| -> Result<()> {
-            let reference = preview
-                .issue
-                .map_or_else(|| preview.branch.clone(), |n| n.to_string());
-            let _worktree_lock = store.lock_worktree(&repository, &reference)?;
-            let _lock = store.lock()?;
-            let record = match preview.issue {
-                Some(issue) => store.find_issue(&repository, issue)?,
-                None => store.find_branch(&repository, &preview.branch)?,
-            }
-            .context("worktree is no longer managed")?;
-            if serde_json::to_value(&record)? != serde_json::to_value(&preview)? {
-                bail!("worktree record changed after preview; run wt clean again");
-            }
-            let current_base = git_output_in(
+    let started = Instant::now();
+    let total = candidates.len();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Verbose output streams raw logs, so it stays serial and readable.
+    let workers = if verbose { 1 } else { total.min(4) };
+    let (mut removed, mut failed) = (0, 0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let (store, repo, base, repository, checks, candidates, next) = (
+                &store,
                 &repo,
-                ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-            )?;
-            let (current_head, _) = clean_candidate(&repo, &record, &base, &current_base, &checks)?;
-            if current_head != head {
-                bail!("HEAD changed after preview; run wt clean again");
-            }
-            if !skip_teardown {
-                run_recorded_teardown(&store, &record, verbose)?;
-            }
-            // A teardown may itself change files or switch branches.
-            let (after_teardown, _) =
-                clean_candidate(&repo, &record, &base, &current_base, &checks)?;
-            if after_teardown != head {
-                bail!("HEAD changed during teardown");
-            }
-            remove_recorded_worktree(&repo, &record, false)?;
-            store.delete(&record)
-        })();
-        match result {
-            Ok(()) => {
-                removed += 1;
-                println!("Removed {}", preview.branch);
-            }
-            Err(error) => {
-                failed += 1;
-                eprintln!("Skipped {}: {error:#}", preview.branch);
+                &base,
+                &repository,
+                &checks,
+                &candidates,
+                &next,
+            );
+            scope.spawn(move || {
+                ui::set_quiet(!verbose);
+                while let Some(candidate) =
+                    candidates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    let result = remove_candidate(
+                        store,
+                        repo,
+                        repository,
+                        base,
+                        checks,
+                        candidate,
+                        skip_teardown,
+                    );
+                    if sender.send((&candidate.record.branch, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        let mut done = 0;
+        loop {
+            ui::status(&format!("Removing worktrees {done}/{total}"), started);
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok((branch, result)) => {
+                    done += 1;
+                    ui::clear_status();
+                    match result {
+                        Ok(()) => {
+                            removed += 1;
+                            println!("Removed {branch}");
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            eprintln!("Skipped {branch}: {error:#}");
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        ui::clear_status();
+    });
+    // Pruning while other removals run could drop an entry Git is still removing.
+    // Prune only drops Git's records of worktrees whose directory is gone.
+    if candidates
+        .iter()
+        .any(|candidate| matches!(candidate.inspection, Inspection::Missing))
+    {
+        if let Err(error) = run_git(&repo, ["worktree", "prune"]) {
+            failed += 1;
+            eprintln!("Could not prune missing worktrees: {error:#}");
+        }
     }
-    println!("Removed {removed} worktree(s). Branches kept.");
+    println!(
+        "Removed {removed} worktree(s) in {:.1}s. Branches kept.",
+        started.elapsed().as_secs_f64()
+    );
     if failed > 0 {
         bail!("{failed} candidate(s) could not be removed");
     }
     Ok(())
+}
+
+/// Rechecks a previewed candidate and removes it. Changes that were not in
+/// the preview are never discarded, even with `--force`.
+fn remove_candidate(
+    store: &Store,
+    repo: &Path,
+    repository: &str,
+    base: &str,
+    checks: &MergeChecks,
+    candidate: &Candidate,
+    skip_teardown: bool,
+) -> Result<()> {
+    let preview = &candidate.record;
+    let reference = preview
+        .issue
+        .map_or_else(|| preview.branch.clone(), |n| n.to_string());
+    let _worktree_lock = store.lock_worktree(repository, &reference)?;
+    let record = {
+        let _lock = store.lock()?;
+        match preview.issue {
+            Some(issue) => store.find_issue(repository, issue)?,
+            None => store.find_branch(repository, &preview.branch)?,
+        }
+        .context("worktree is no longer managed")?
+    };
+    if serde_json::to_value(&record)? != serde_json::to_value(preview)? {
+        bail!("worktree record changed after preview; run wt clean again");
+    }
+    let (head, previewed) = match &candidate.inspection {
+        Inspection::Missing => {
+            match fs::symlink_metadata(&record.path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => bail!("worktree path reappeared after preview; run wt clean again"),
+            }
+            // Git's stale entry is pruned once all workers have finished.
+            let _lock = store.lock()?;
+            return store.delete(&record);
+        }
+        Inspection::Merged { head, changes, .. } => (head, changes),
+    };
+    let current_base = git_output_in(
+        repo,
+        ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )?;
+    let recheck = |stage: &str| -> Result<()> {
+        let Inspection::Merged {
+            head: current,
+            changes,
+            ..
+        } = clean_candidate(repo, &record, base, &current_base, checks)?
+        else {
+            bail!("worktree path disappeared {stage}");
+        };
+        if &current != head {
+            bail!("HEAD changed {stage}");
+        }
+        if let Some(change) = changes.iter().find(|change| !previewed.contains(change)) {
+            bail!("{change}");
+        }
+        Ok(())
+    };
+    recheck("after preview; run wt clean again")?;
+    if !skip_teardown {
+        run_recorded_teardown(store, &record, false)?;
+    }
+    // A teardown may itself change files or switch branches.
+    recheck("during teardown")?;
+    remove_recorded_worktree(repo, &record, !previewed.is_empty())?;
+    let _lock = store.lock()?;
+    store.delete(&record)
 }
 
 fn clean_candidate(
@@ -691,8 +891,12 @@ fn clean_candidate(
     base: &str,
     base_commit: &str,
     checks: &MergeChecks,
-) -> Result<(String, String)> {
-    let path = fs::canonicalize(&record.path).context("worktree path is missing or unavailable")?;
+) -> Result<Inspection> {
+    match fs::symlink_metadata(&record.path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Inspection::Missing),
+        _ => {}
+    }
+    let path = fs::canonicalize(&record.path).context("worktree path is unavailable")?;
     if fs::canonicalize(std::env::current_dir()?)?.starts_with(&path) {
         bail!("current worktree");
     }
@@ -725,24 +929,39 @@ fn clean_candidate(
     {
         bail!("base branch");
     }
-    ensure_safe_to_remove(record)?;
     let head = git_output_in(&path, ["rev-parse", "--verify", "HEAD"])?;
     let output = Command::new("git")
         .current_dir(repo)
         .args(["merge-base", "--is-ancestor", &head, base_commit])
         .output()?;
-    match output.status.code() {
-        Some(0) => Ok((head, format!("merged into {base}"))),
+    let (mut reason, proven_by_pr) = match output.status.code() {
+        Some(0) => (format!("merged into {base}"), false),
         Some(1) => {
             let number = merged_pull_request(repo, record, base, &head, checks)?
                 .with_context(|| format!("no merged PR found for this branch into {base}"))?;
-            Ok((head, format!("merged PR #{number} into {base}")))
+            (format!("merged PR #{number} into {base}"), true)
         }
         _ => bail!(
             "cannot check merge status: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ),
+    };
+    // Checked after the merge status so unmerged work is never offered for removal.
+    let changes = blocking_changes(record)?;
+    // A new branch without commits is also an ancestor of the base. Only a
+    // merged PR shows that its local changes belong to finished work.
+    if !changes.is_empty() && !proven_by_pr {
+        match merged_pull_request(repo, record, base, &head, checks) {
+            Ok(Some(number)) => reason = format!("merged PR #{number} into {base}"),
+            // The local change explains more than a failed or empty PR lookup.
+            _ => bail!("{}", changes[0]),
+        }
     }
+    Ok(Inspection::Merged {
+        head,
+        reason,
+        changes,
+    })
 }
 
 fn merged_pull_request(
@@ -865,22 +1084,26 @@ fn included_in_merged_head(
 }
 
 fn remove_recorded_worktree(repo: &Path, record: &Record, force: bool) -> Result<()> {
-    if force {
-        return progress("Removing worktree", "Worktree removed", || {
-            run_git(
-                repo,
-                ["worktree", "remove", "--force", path_str(&record.path)?],
-            )
-        });
+    let trash = cleanup::trash_dir(&record.path).context("worktree path has no parent")?;
+    let cleared = progress(
+        "Clearing generated files",
+        "Generated files cleared",
+        || delete_managed_files(record, &trash, force),
+    );
+    // Forced removal lets Git delete whatever could not be moved aside.
+    if !force {
+        cleared?;
     }
-    progress(
-        "Cleaning generated files",
-        "Generated files removed",
-        || delete_managed_files(record),
-    )?;
-    progress("Removing worktree", "Worktree removed", || {
-        run_git(repo, ["worktree", "remove", path_str(&record.path)?])
-    })
+    let removed = progress("Removing worktree", "Worktree removed", || {
+        let path = path_str(&record.path)?;
+        if force {
+            run_git(repo, ["worktree", "remove", "--force", path])
+        } else {
+            run_git(repo, ["worktree", "remove", path])
+        }
+    });
+    cleanup::purge_in_background(&trash);
+    removed
 }
 
 fn config_from_options(options: InitOptions, repository: &Repository) -> Config {
@@ -1175,7 +1398,8 @@ fn ensure_trusted_commands(
 fn run_hook(name: &str, command: &str, directory: &Path, verbose: bool) -> Result<()> {
     let mut hook = Command::new("/bin/sh");
     hook.args(["-c", command]).current_dir(directory);
-    let status = if verbose || !ui::terminal() {
+    // Parallel cleanup captures logs even without a terminal, so output stays readable.
+    let status = if verbose || (!ui::terminal() && !ui::quiet()) {
         if ui::terminal() {
             eprintln!("  {}", style(command, 2));
         }
@@ -1202,9 +1426,17 @@ fn run_hook(name: &str, command: &str, directory: &Path, verbose: bool) -> Resul
             Ok(status)
         });
         if result.is_err() {
-            eprintln!("\n  {}\n", style(command, 2));
             log.rewind()?;
-            io::copy(&mut log, &mut io::stderr())?;
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut log, &mut bytes)?;
+            let output = String::from_utf8_lossy(&bytes);
+            if ui::quiet() {
+                return result
+                    .map(|_| ())
+                    .with_context(|| format!("{command}\n{}", output.trim_end()));
+            }
+            eprintln!("\n  {}\n", style(command, 2));
+            eprint!("{output}");
         }
         result?
     };
@@ -1229,27 +1461,35 @@ fn run_recorded_teardown(store: &Store, record: &Record, verbose: bool) -> Resul
 }
 
 fn ensure_safe_to_remove(record: &Record) -> Result<()> {
+    match blocking_changes(record)?.into_iter().next() {
+        Some(change) => bail!("{change}"),
+        None => Ok(()),
+    }
+}
+
+/// Every local change that removal without `--force` would lose.
+fn blocking_changes(record: &Record) -> Result<Vec<String>> {
+    let mut changes = Vec::new();
     for (path, expected) in &record.copied_files {
         let actual = environment::fingerprint(&record.path, path)?;
         if &actual != expected {
-            bail!("changed managed file: {}", path.display());
+            changes.push(format!("changed managed file: {}", path.display()));
         }
     }
     for (kind, path) in worktree_changes(&record.path)? {
         if kind != "??" && kind != "!!" {
-            bail!("worktree contains tracked changes: {path}");
-        }
-        if !is_removable_path(Path::new(&path), record) {
+            changes.push(format!("worktree contains tracked changes: {path}"));
+        } else if !is_removable_path(Path::new(&path), record) {
             if kind == "!!"
                 && path.ends_with('/')
                 && contains_only_directories(&record.path.join(path.trim_end_matches('/')))?
             {
                 continue;
             }
-            bail!("worktree contains an unmanaged file: {path}");
+            changes.push(format!("worktree contains an unmanaged file: {path}"));
         }
     }
-    Ok(())
+    Ok(changes)
 }
 
 fn contains_only_directories(path: &Path) -> Result<bool> {
@@ -1301,12 +1541,17 @@ fn is_removable_path(path: &Path, record: &Record) -> bool {
             .any(|disposable| path == disposable || path.starts_with(disposable))
 }
 
-fn delete_managed_files(record: &Record) -> Result<()> {
+fn delete_managed_files(record: &Record, trash: &Path, force: bool) -> Result<()> {
     for path in record.copied_files.keys() {
-        fs::remove_file(record.path.join(path))
-            .with_context(|| format!("remove {}", record.path.join(path).display()))?;
+        match fs::remove_file(record.path.join(path)) {
+            Err(error) if !(force && error.kind() == io::ErrorKind::NotFound) => {
+                return Err(error)
+                    .with_context(|| format!("remove {}", record.path.join(path).display()));
+            }
+            _ => {}
+        }
     }
-    crate::cleanup::remove_paths(&record.path, &record.disposable)
+    cleanup::trash_paths(&record.path, &record.disposable, trash)
 }
 
 fn repository(repo_root: &Path) -> Result<Repository> {

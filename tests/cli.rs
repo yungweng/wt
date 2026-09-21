@@ -227,6 +227,109 @@ fn add_creates_issue_worktree_and_prints_only_its_path() {
         git(&expected, ["branch", "--show-current"]),
         "fix/42-handle-empty-input"
     );
+    let url = "https://github.com/acme/example/issues/42";
+    assert!(String::from_utf8_lossy(&output.stderr).contains(url));
+    fixture.fail_gh_calls();
+    let existing = fixture.wt(["add", "42"]);
+    assert_success(&existing);
+    assert!(String::from_utf8_lossy(&existing.stderr).contains(url));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_function_changes_into_the_added_worktree_only_at_a_terminal() {
+    let fixture = Fixture::new();
+    // A terminal would otherwise offer the setup wizard and wait for input.
+    fixture.write(".wtconfig", "[wt]\n\tbase = main\n");
+    fixture.fail_gh_calls();
+    let bin = Path::new(env!("CARGO_BIN_EXE_wt")).parent().unwrap();
+    let path = format!(
+        "{}:{}:{}",
+        fixture.bin.display(),
+        bin.display(),
+        std::env::var("PATH").unwrap()
+    );
+    let setup_posix = |shell: &str| format!("eval \"$(wt shell {shell})\"");
+    let body = |setup: String, status: &str, assign: &str| {
+        format!(
+            "{setup}\n\
+             cd \"$REPO\"; {assign}; printf '%s\\n' \"$substituted\" > \"$OUT/substituted\"; pwd > \"$OUT/after-substitution\"\n\
+             wt -v add feat/shell; pwd > \"$OUT/interactive\"\n\
+             cd \"$REPO\"; wt add 'bad..name'; echo {status} > \"$OUT/failed\"; pwd > \"$OUT/after-failure\"\n\
+             wt add --help > \"$OUT/help\"\n"
+        )
+    };
+    let posix_assign = "substituted=$(wt add feat/shell)";
+    let mut shells = vec![
+        ("bash", body(setup_posix("bash"), "$?", posix_assign)),
+        ("/bin/bash", body(setup_posix("bash"), "$?", posix_assign)),
+        ("zsh", body(setup_posix("zsh"), "$?", posix_assign)),
+        (
+            "fish",
+            body(
+                "wt shell fish | source".to_owned(),
+                "$status",
+                "set substituted (wt add feat/shell)",
+            ),
+        ),
+    ];
+    shells.retain(|(shell, _)| {
+        Command::new(shell)
+            .args(["-c", "true"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    });
+    assert!(!shells.is_empty());
+    let repo = fs::canonicalize(&fixture.repo).unwrap();
+    for (shell, script) in shells {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("script");
+        fs::write(&file, script).unwrap();
+        // `script` gives the shell a terminal on stdout, as in interactive use.
+        let mut command = Command::new("script");
+        if cfg!(target_os = "macos") {
+            command.args(["-q", "/dev/null", shell, file.to_str().unwrap()]);
+        } else {
+            command.args(["-qec", &format!("{shell} {}", file.display()), "/dev/null"]);
+        }
+        let output = fixture
+            .wt_command([])
+            .get_envs()
+            .fold(command, |mut command, (key, value)| {
+                if let Some(value) = value {
+                    command.env(key, value);
+                }
+                command
+            })
+            .env("PATH", &path)
+            .env("REPO", &repo)
+            .env("OUT", out.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let read = |name: &str| {
+            fs::read_to_string(out.path().join(name))
+                .unwrap_or_else(|_| panic!("{shell}: {name} missing: {output:?}"))
+                .trim()
+                .to_owned()
+        };
+        let worktree = fs::canonicalize(read("substituted")).unwrap();
+        assert!(worktree.ends_with("example/feat-shell"), "{shell}");
+        assert_eq!(
+            PathBuf::from(read("after-substitution")),
+            repo,
+            "{shell}: substitution must not change directory"
+        );
+        assert_eq!(
+            fs::canonicalize(read("interactive")).unwrap(),
+            worktree,
+            "{shell}"
+        );
+        assert_ne!(read("failed"), "0", "{shell}: failure status");
+        assert_eq!(PathBuf::from(read("after-failure")), repo, "{shell}");
+        assert!(read("help").contains("Create a worktree"), "{shell}");
+    }
 }
 
 #[test]
@@ -246,6 +349,7 @@ fn add_manages_a_branch_worktree_without_calling_github() {
         git(&expected, ["branch", "--show-current"]),
         "feat/local-work"
     );
+    assert!(!String::from_utf8_lossy(&added.stderr).contains("https://"));
     let listed = fixture.wt(["list", "--porcelain"]);
     assert_success(&listed);
     assert_eq!(
@@ -327,6 +431,9 @@ fn add_opens_a_pull_request_on_its_head_branch() {
     assert_eq!(
         git(&expected, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
         "origin/feat/shared"
+    );
+    assert!(
+        String::from_utf8_lossy(&added.stderr).contains("https://github.com/acme/example/pull/7")
     );
     fixture.fail_gh_calls();
     let reused = fixture.wt(["add", "7"]);
@@ -704,7 +811,7 @@ fn bootstrap_logs_preserve_stdout_stderr_order_and_keep_stdout_path_only() {
     assert_success(&added);
     assert_eq!(
         String::from_utf8_lossy(&added.stderr),
-        "first\nsecond\nthird\n"
+        "first\nsecond\nthird\nhttps://github.com/acme/example/issues/42\n"
     );
     let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
     assert!(path.join(".git").exists());
@@ -1291,29 +1398,67 @@ fn cleanup_failure_keeps_worktree_and_record_and_reports_the_path() {
         "--disposable",
         "generated",
         "--teardown",
-        "chmod 500 generated/package/lib",
+        "chmod 500 .",
         "--yes",
     ]));
     let added = fixture.wt(["add", "42"]);
     assert_success(&added);
     let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
-    let directory = path.join("generated/package/lib");
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("cache"), "cached").unwrap();
+    fs::create_dir_all(path.join("generated/package/lib")).unwrap();
+    fs::write(path.join("generated/package/lib/cache"), "cached").unwrap();
 
     let removed = fixture.wt(["remove", "42"]);
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
 
     assert!(!removed.status.success());
     let stderr = String::from_utf8_lossy(&removed.stderr);
-    assert!(stderr.contains("generated/package/lib"), "{stderr}");
+    assert!(stderr.contains("generated"), "{stderr}");
     assert!(!stderr.contains("Worktree removed"));
     assert!(path.join(".git").exists());
+    assert!(path.join("generated/package/lib/cache").exists());
     assert!(
         String::from_utf8_lossy(&fixture.wt(["list"]).stdout).contains("fix/42-handle-empty-input")
     );
     assert_success(&fixture.wt(["remove", "42", "--skip-teardown"]));
     assert!(!path.exists());
+}
+
+#[test]
+fn remove_moves_generated_files_aside_and_purges_them_in_the_background() {
+    let fixture = Fixture::new();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tbase = main\n\tdisposable = generated\n",
+    );
+    let added = fixture.wt(["add", "feat/trash"]);
+    assert_success(&added);
+    let path = PathBuf::from(String::from_utf8(added.stdout).unwrap().trim());
+    fs::create_dir_all(path.join("generated/package/lib")).unwrap();
+    fs::write(path.join("generated/package/lib/index.js"), "cached").unwrap();
+
+    assert_success(&fixture.wt(["remove", "feat/trash"]));
+
+    assert!(!path.exists());
+    let trash = fixture.worktrees.join("example/.wt-trash");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while trash.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!trash.exists(), "background purge left {}", trash.display());
+    assert_eq!(
+        git(&fixture.repo, ["branch", "--list", "feat/trash"]),
+        "feat/trash"
+    );
+}
+
+#[test]
+fn purge_trash_ignores_directories_that_are_not_wt_trash() {
+    let fixture = Fixture::new();
+    let directory = fixture.worktrees.join("keep");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("file"), "keep").unwrap();
+    assert_success(&fixture.wt(["purge-trash", directory.to_str().unwrap()]));
+    assert!(directory.join("file").exists());
 }
 
 #[test]
@@ -1413,14 +1558,24 @@ fn clean_preserves_tracked_untracked_ignored_and_changed_copied_files() {
         .unwrap();
     }
     assert_success(&fixture.wt(["add", "safe"]));
-    let output = fixture.wt(["clean", "--yes"]);
+    // Unmerged local work is never offered for removal, even with --force.
+    assert_success(&fixture.wt(["add", "unmerged"]));
+    let unmerged = fixture.worktrees.join("example/unmerged");
+    command(
+        &unmerged,
+        "git",
+        ["commit", "--allow-empty", "-m", "unmerged"],
+    );
+    fs::write(unmerged.join("notes"), "unfinished\n").unwrap();
+    fixture.merged_pull_requests(&[]);
+    // Without their own commits or a merged PR, changed worktrees may be new
+    // work in progress, so even --force keeps them.
+    let output = fixture.wt(["clean", "--yes", "--force"]);
     assert_success(&output);
     let text = String::from_utf8_lossy(&output.stdout);
-    for branch in ["tracked", "untracked", "ignored", "copied"] {
-        assert!(
-            text.split("Skipped (").nth(1).unwrap().contains(branch),
-            "{text}"
-        );
+    let skipped = text.split("Skipped (5)").nth(1).unwrap();
+    for branch in ["tracked", "untracked", "ignored", "copied", "unmerged"] {
+        assert!(skipped.contains(branch), "{text}");
         assert!(fixture.worktrees.join("example").join(branch).exists());
     }
     assert!(!fixture.worktrees.join("example/safe").exists());
@@ -1428,6 +1583,71 @@ fn clean_preserves_tracked_untracked_ignored_and_changed_copied_files() {
         fs::read_to_string(fixture.worktrees.join("example/copied/.env")).unwrap(),
         "SECRET=changed\n"
     );
+
+    let head = git(&fixture.repo, ["rev-parse", "HEAD"]);
+    fixture.merged_pull_requests(&[
+        ("tracked", &head),
+        ("untracked", &head),
+        ("ignored", &head),
+        ("copied", &head),
+    ]);
+    let output = fixture.wt(["clean", "--yes"]);
+    assert_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let forced = text.split("Needs --force (4)").nth(1).unwrap();
+    for branch in ["tracked", "untracked", "ignored", "copied"] {
+        assert!(forced.contains(branch), "{text}");
+        assert!(fixture.worktrees.join("example").join(branch).exists());
+    }
+    assert!(text.contains("wt clean --force"), "{text}");
+    assert!(
+        text.split("Skipped (1)")
+            .nth(1)
+            .unwrap()
+            .contains("unmerged"),
+        "{text}"
+    );
+
+    let preview = fixture.wt(["clean", "--dry-run", "--force"]);
+    assert_success(&preview);
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(text.contains("Ready to remove (4)"), "{text}");
+    assert!(text.contains("Modified: README.md"), "{text}");
+    assert!(text.contains("lose the local changes"), "{text}");
+
+    assert_success(&fixture.wt(["clean", "--yes", "--force"]));
+    for branch in ["tracked", "untracked", "ignored", "copied"] {
+        assert!(!fixture.worktrees.join("example").join(branch).exists());
+        assert_eq!(git(&fixture.repo, ["branch", "--list", branch]), branch);
+    }
+    assert_eq!(
+        fs::read_to_string(unmerged.join("notes")).unwrap(),
+        "unfinished\n"
+    );
+}
+
+#[test]
+fn forced_clean_keeps_changes_that_appear_after_the_preview() {
+    let fixture = Fixture::new();
+    fixture.write(
+        ".wtconfig",
+        "[wt]\n\tbase = main\n\tteardown = echo late > late-notes\n",
+    );
+    assert_success(&fixture.wt(["trust", "--yes"]));
+    assert_success(&fixture.wt(["add", "dirty"]));
+    let path = fixture.worktrees.join("example/dirty");
+    fs::write(path.join("notes"), "shown in preview\n").unwrap();
+    fixture.merged_pull_requests(&[("dirty", &git(&path, ["rev-parse", "HEAD"]))]);
+
+    let output = fixture.wt(["clean", "--yes", "--force"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unmanaged file: late-notes"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(path.join("notes").exists());
 }
 
 #[test]
@@ -1536,17 +1756,36 @@ fn clean_skips_current_base_detached_switched_and_missing_worktrees() {
         .unwrap();
     assert_success(&output);
     let text = String::from_utf8_lossy(&output.stdout);
-    for branch in ["main", "current", "detached", "switched", "missing"] {
-        assert!(
-            text.split("Skipped (").nth(1).unwrap().contains(branch),
-            "{text}"
-        );
+    let skipped = text.split("Skipped (").nth(1).unwrap();
+    for branch in ["main", "current", "detached", "switched"] {
+        assert!(skipped.contains(branch), "{text}");
+        assert!(root.join(branch).exists());
     }
+    let forced = text.split("Needs --force (1)").nth(1).unwrap();
+    assert!(
+        forced
+            .split("Skipped (")
+            .next()
+            .unwrap()
+            .contains("missing"),
+        "{text}"
+    );
+    assert!(text.contains("worktree path is missing"), "{text}");
+    assert!(text.contains("current worktree"), "{text}");
+    assert!(text.contains("base branch"), "{text}");
+
+    let forced = fixture
+        .wt_command(["clean", "--yes", "--force"])
+        .current_dir(root.join("current/subdirectory"))
+        .output()
+        .unwrap();
+    assert_success(&forced);
+    let listed = String::from_utf8(fixture.wt(["list", "--porcelain"]).stdout).unwrap();
+    assert!(!listed.contains("\tmissing\t"), "{listed}");
+    assert!(!git(&fixture.repo, ["worktree", "list"]).contains("/missing "));
     for branch in ["main", "current", "detached", "switched"] {
         assert!(root.join(branch).exists());
     }
-    assert!(text.contains("current worktree"), "{text}");
-    assert!(text.contains("base branch"), "{text}");
 }
 
 #[test]
@@ -1652,7 +1891,8 @@ fn clean_keeps_a_candidate_whose_head_changes_after_preview_even_if_merged() {
     let root = fixture.worktrees.join("example");
     let before = git(&root.join("b"), ["rev-parse", "HEAD"]);
     let output = fixture
-        .wt_command(["clean", "--yes"])
+        // Serial order makes the teardown of `a` change `b` before its recheck.
+        .wt_command(["clean", "--yes", "--verbose"])
         .env("CLEAN_TEST_REPO", &fixture.repo)
         .output()
         .unwrap();
@@ -1987,6 +2227,22 @@ impl Fixture {
             "#!/bin/sh\nif [ \"$1\" = repo ]; then exit 99; fi\nprintf '{\"number\":%s,\"title\":\"Handle empty input\",\"state\":\"OPEN\",\"labels\":[{\"name\":\"bug\"}],\"url\":\"https://github.com/acme/example/issues/%s\"}\\n' \"$3\" \"$3\"\n",
         )
         .unwrap();
+    }
+
+    /// Serves merged pull requests into main for `(branch, head)` pairs.
+    fn merged_pull_requests(&self, branches: &[(&str, &str)]) {
+        let prs = branches
+            .iter()
+            .enumerate()
+            .map(|(number, (branch, head))| {
+                serde_json::json!({
+                    "number": number + 1, "state": "MERGED", "headRefName": branch,
+                    "headRefOid": head, "baseRefName": "main", "isCrossRepository": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(self.bin.join("prs.json"), serde_json::to_vec(&prs).unwrap()).unwrap();
+        fs::write(self.bin.join("gh"), "#!/bin/sh\ncat \"${0%/*}/prs.json\"\n").unwrap();
     }
 
     /// Serves every number as a pull request from `head`; other gh calls fail.

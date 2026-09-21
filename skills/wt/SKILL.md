@@ -19,7 +19,8 @@ existing suitable worktree and preserve unrelated changes.
   branch. Fork pull requests are refused; use `gh pr checkout` instead.
 - Standalone work: run `wt add <branch>` with an exact, descriptive branch name.
 
-Use the path printed by `wt add` as the working directory. A number or GitHub
+Use the path printed by `wt add` on stdout as the working directory; stderr
+also shows the issue or pull request URL. A number or GitHub
 issue or pull request URL selects an issue or pull request; every other valid
 Git branch name creates a standalone worktree without a tracking issue.
 
@@ -31,4 +32,5 @@ installed, report that blocker.
 
 Use `wt list` to inspect managed worktrees. Remove one with
 `wt remove <issue-number-or-branch>`. Inspect its status first; use `--force`
-only when the user explicitly authorizes discarding changes.
+only when the user explicitly authorizes discarding changes. The same applies
+to `wt clean --force`, which also removes merged worktrees with local changes.
